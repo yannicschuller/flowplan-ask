@@ -7,17 +7,39 @@ import { DAY, now } from "./clock";
 import { HttpError } from "./http";
 import type { Settings } from "./settings";
 import { usd } from "./models";
+import { allowedLink } from "./sanitize";
 import type { Source } from "./limits";
 import type { Locale } from "./docs";
 
-export function scrub(text: string) {
-  return text
+const MASKS = (text: string) =>
+  text
     .replace(/\bsk-ant-[A-Za-z0-9_-]+/g, "[secret]")
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[e-mail]")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[address]")
     .replace(/\b(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}\b/gi, "[address]")
     .replace(/\b[A-Za-z0-9_\-+/=]{32,}\b/g, "[secret]")
     .replace(/(?<![\w.])\+?\d[\d \-/]{6,}\d\b/g, "[number]");
+
+// Links the answers may contain (the sanitiser's allow-list: the docs, the
+// website, Flowplan's GitHub repositories, the Discord invite) are public and
+// stay readable in the log (#1) – only their query and fragment are masked
+// like any other text, so a token there is still hidden. Every other link is
+// masked as text.
+const LINK = /\bhttps?:\/\/[^\s<>"'`)\]]+/gi;
+const SLOT = /\ue000(\d+)\ue001/g;
+export function scrub(text: string) {
+  const kept: string[] = [];
+  const held = text.replace(/[\ue000-\ue001]/g, "").replace(LINK, (match) => {
+    const trail = /[.,;:!?*_]+$/.exec(match)?.[0] ?? "";
+    const url = trail ? match.slice(0, -trail.length) : match;
+    if (!allowedLink(url)) return match;
+    const cut = url.search(/[?#]/);
+    const base = cut < 0 ? url : url.slice(0, cut);
+    const rest = cut < 0 ? "" : MASKS(url.slice(cut));
+    kept.push(base + rest);
+    return `\ue000${kept.length - 1}\ue001${trail}`;
+  });
+  return MASKS(held).replace(SLOT, (_, i: string) => kept[Number(i)] ?? "");
 }
 
 export type LogEntry = {
