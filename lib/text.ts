@@ -3,8 +3,11 @@
 // flowplan-docs/lib/search.ts).
 
 // Lower case without accents; ß becomes "ss", ä/ö/ü their bare letters.
+// Compatibility forms become their plain letters and digits first (NFKD:
+// "DAVx⁵" is "davx5", "ﬁ" is "fi"), then the accents go.
 export const fold = (text: string) =>
   text
+    .normalize("NFKD")
     .toLowerCase()
     .normalize("NFD")
     .replace(/[̀-ͯ]/g, "")

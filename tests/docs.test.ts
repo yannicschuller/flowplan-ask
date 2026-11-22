@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setup } from "./helpers";
-import { docsIndex, docsTerms, forgetDocs, headingId, loadIndex, parseLlms, pickSections, rank, refreshDocs, REFRESH_MS, splitPage, DOCS_BUDGET_CHARS } from "../lib/docs";
+import { docsIndex, docsTerms, forgetDocs, headingId, loadIndex, parseKeywords, parseLlms, pickSections, rank, refreshDocs, REFRESH_MS, splitPage, DOCS_BUDGET_CHARS } from "../lib/docs";
+import { fold, terms } from "../lib/text";
 import { clock } from "../lib/clock";
 import { llms } from "./docs-mock";
 
@@ -11,7 +12,7 @@ test("llms.txt: only Markdown pages directly below DOCS_URL/<locale>/", () => {
   const entries = parseLlms(llms(docs.base, "en"), docs.base, "en");
   assert.deepEqual(
     entries.map((e) => e.slug),
-    ["first-steps", "backup", "self-hosting", "tricky"],
+    ["first-steps", "backup", "self-hosting", "tricky", "user-management", "scim-and-ldap", "sign-in", "views"],
   );
   assert.equal(entries[0].mdUrl, `${docs.base}/en/first-steps.md`);
   assert.equal(parseLlms(llms(docs.base, "en"), docs.base, "de").length, 0);
@@ -30,8 +31,8 @@ test("pages are cut into sections at ## (long ones at ###), with absolute links 
   const index = await loadIndex(docs.base);
   const en = index.locales.en!;
   const de = index.locales.de!;
-  assert.equal(en.pages, 4);
-  assert.equal(de.pages, 2);
+  assert.equal(en.pages, 8);
+  assert.equal(de.pages, 4);
   const urls = en.sections.map((s) => s.url);
   assert.ok(urls.includes(`${docs.base}/en/first-steps`), "the page intro");
   assert.ok(urls.includes(`${docs.base}/en/first-steps#sign-in-or-sign-up`));
@@ -97,7 +98,7 @@ test("the index is cached, refreshed after a few hours and kept when the docs ar
   await refreshDocs();
   const second = await docsIndex();
   assert.notEqual(second, first);
-  assert.equal(second!.locales.en!.pages, 4);
+  assert.equal(second!.locales.en!.pages, 8);
   clock.now = () => Date.now();
 });
 
@@ -111,4 +112,65 @@ test("splitPage keeps front matter out and names the intro after the page", () =
     ],
   );
   assert.doesNotMatch(sections[0].text, /keywords/);
+});
+
+test("keywords.json: the pages' keywords are loaded with the lists and lift their pages", async () => {
+  const index = await loadIndex(docs.base);
+  assert.ok(docs.fetched.includes("/keywords.json") && docs.fetched.includes("/de/keywords.json"));
+  const top = (q: string, locale: "de" | "en") => rank(index, q, locale)[0]?.section.url;
+  // The page says "Adresse wechseln"; its keywords say "E-Mail-Adresse ändern".
+  assert.equal(top("E-Mail-Adresse ändern", "de"), `${docs.base}/de/sign-in#e-mail-und-passwort`);
+  assert.equal(top("CalDAV planned", "en"), `${docs.base}/en/views#sync-both-ways-caldav`);
+  // "Adding people" never says "user"; the page's keywords "create user, new user" do.
+  assert.equal(top("how can I create a new user", "en"), `${docs.base}/en/user-management#adding-people`);
+  assert.ok(pickSections(index, "how can I create a new user", "en").some((s) => s.url.endsWith("#adding-people")));
+  // Keywords of a page that is not in llms.txt count for nothing.
+  assert.ok(!index.locales.en!.keywords.has("not-a-page"));
+  assert.ok(!index.vocabulary.has("ignored"));
+  // Keywords are words of the docs for the topics statistics, too.
+  assert.ok(index.vocabulary.has("davx5"));
+
+  // Without the keywords the same questions land elsewhere: they are what made the difference.
+  docs.state.keywords = false;
+  try {
+    const plain = await loadIndex(docs.base);
+    assert.equal(plain.locales.en!.keywords.size, 0);
+    assert.notEqual(rank(plain, "how can I create a new user", "en")[0]?.section.url, `${docs.base}/en/user-management#adding-people`);
+    assert.notEqual(rank(plain, "E-Mail-Adresse ändern", "de")[0]?.section.url, `${docs.base}/de/sign-in#e-mail-und-passwort`);
+  } finally {
+    docs.state.keywords = true;
+  }
+});
+
+test("keywords.json missing or broken: Flo ranks on the pages alone", async () => {
+  for (const broken of [false, "not json", "[1,2]", '{"views": "caldav", "../x": ["a"], "sign-in": [1, ""]}']) {
+    docs.state.keywords = broken;
+    try {
+      const index = await loadIndex(docs.base);
+      assert.equal(index.locales.en!.pages, 8, String(broken));
+      assert.equal(index.locales.en!.keywords.size, 0, String(broken));
+      assert.equal(rank(index, "restore a backup", "en")[0]?.section.url, `${docs.base}/en/backup#restore-from-a-backup`);
+    } finally {
+      docs.state.keywords = true;
+    }
+  }
+  assert.deepEqual([...parseKeywords('{"a-b": ["x", 2, "y"], "Bad Slug": ["z"]}')], [["a-b", ["x", "y"]]]);
+  assert.equal(parseKeywords(JSON.stringify({ p: Array.from({ length: 100 }, (_, i) => `k${i}`) })).get("p")!.length, 40);
+  assert.equal(parseKeywords(null).size, 0);
+});
+
+test("DAVx⁵ is davx5: compatibility forms are folded (NFKD)", async () => {
+  assert.equal(fold("DAVx⁵"), "davx5");
+  assert.equal(fold("ﬁle Café Straße"), "file cafe strasse");
+  assert.deepEqual(terms("DAVx⁵ (Android)"), ["davx5", "android"]);
+  const index = await loadIndex(docs.base);
+  assert.equal(rank(index, "davx5", "en")[0]?.section.url, `${docs.base}/en/views#sync-both-ways-caldav`);
+  assert.equal(rank(index, "DAVx⁵", "en")[0]?.section.url, `${docs.base}/en/views#sync-both-ways-caldav`);
+  // Through the text alone, too (the page's keywords say davx5 as well).
+  docs.state.keywords = false;
+  try {
+    assert.equal(rank(await loadIndex(docs.base), "davx5", "en")[0]?.section.url, `${docs.base}/en/views#sync-both-ways-caldav`);
+  } finally {
+    docs.state.keywords = true;
+  }
 });

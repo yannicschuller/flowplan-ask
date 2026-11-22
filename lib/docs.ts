@@ -5,6 +5,10 @@
 // Only addresses below DOCS_URL are ever fetched. A question gets the best
 // sections by BM25 (title and heading count more), within a size budget,
 // each with its URL (page + #anchor, the same ids as the docs site).
+// `${DOCS_URL}/keywords.json` and `/de/keywords.json` ({slug: [keywords]},
+// the pages' front-matter keywords) are loaded with the lists; a page's
+// keywords are one more field of the ranking. Without that file Flo ranks
+// on the pages alone.
 import { config } from "./config";
 import { fold, stem, synonymsOf, terms, words } from "./text";
 import { now } from "./clock";
@@ -22,8 +26,11 @@ export type Section = {
   text: string;
   tf: Map<string, number>;
   length: number;
+  // The page's first section (its title and lead).
+  intro: boolean;
 };
-type LocaleIndex = { sections: Section[]; df: Map<string, number>; avgLength: number; pages: number };
+// `keywords`: per page, the terms of its keywords with their counts.
+type LocaleIndex = { sections: Section[]; df: Map<string, number>; avgLength: number; pages: number; keywords: Map<string, Map<string, number>> };
 // `fresh`: the languages loaded this time (the others kept from before).
 export type DocsIndex = { loadedAt: number; base: string; locales: Partial<Record<Locale, LocaleIndex>>; vocabulary: Set<string>; fresh: Locale[] };
 
@@ -33,6 +40,8 @@ const FETCH_TIMEOUT_MS = 10_000;
 const MAX_INDEX_BYTES = 1_000_000;
 const MAX_PAGE_BYTES = 400_000;
 const MAX_PAGES = 400;
+const MAX_KEYWORDS_BYTES = 200_000;
+const MAX_KEYWORDS = 40;
 const CONCURRENCY = 8;
 // The docs part of a prompt: about 8,000 tokens at most.
 export const DOCS_BUDGET_CHARS = 24_000;
@@ -84,6 +93,27 @@ export function parseLlms(text: string, base: string, locale: Locale): Entry[] {
     seen.add(slug);
     out.push({ title: m[1], slug, mdUrl: m[2], summary: (m[3] || "").slice(0, 400) });
     if (out.length >= MAX_PAGES) break;
+  }
+  return out;
+}
+
+// keywords.json: {slug: [keyword, …]}. Anything that is not such an object
+// counts as no keywords; odd entries are skipped, long lists cut.
+export function parseKeywords(text: string | null): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  if (!text) return out;
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return out;
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return out;
+  for (const [slug, list] of Object.entries(data as Record<string, unknown>)) {
+    if (!/^[a-z0-9][a-z0-9-]{0,80}$/.test(slug) || !Array.isArray(list)) continue;
+    const keywords = list.filter((k): k is string => typeof k === "string" && k.length > 0 && k.length <= 100).slice(0, MAX_KEYWORDS);
+    if (keywords.length) out.set(slug, keywords);
+    if (out.size >= MAX_PAGES) break;
   }
   return out;
 }
@@ -209,26 +239,36 @@ export function splitPage(markdown: string, entry: Entry, base: string, locale: 
     for (const t of terms(text)) add(t, 1);
     let length = 0;
     for (const v of tf.values()) length += v;
-    sections.push({ locale, slug: entry.slug, pageTitle, heading, url: p.anchor ? `${pageUrl}#${p.anchor}` : pageUrl, text, tf, length });
+    sections.push({ locale, slug: entry.slug, pageTitle, heading, url: p.anchor ? `${pageUrl}#${p.anchor}` : pageUrl, text, tf, length, intro: !sections.length });
   }
   return sections;
 }
 
-function buildLocale(sections: Section[], pages: number): LocaleIndex {
+function buildLocale(sections: Section[], pages: number, keywordLists = new Map<string, string[]>()): LocaleIndex {
   const df = new Map<string, number>();
   let total = 0;
   for (const s of sections) {
     total += s.length;
     for (const t of s.tf.keys()) df.set(t, (df.get(t) ?? 0) + 1);
   }
-  return { sections, df, avgLength: sections.length ? total / sections.length : 1, pages };
+  // Keywords only of pages that are in the index.
+  const slugs = new Set(sections.map((s) => s.slug));
+  const keywords = new Map<string, Map<string, number>>();
+  for (const [slug, list] of keywordLists) {
+    if (!slugs.has(slug)) continue;
+    const tf = new Map<string, number>();
+    for (const t of list.flatMap((k) => terms(k))) tf.set(t, (tf.get(t) ?? 0) + 1);
+    if (tf.size) keywords.set(slug, tf);
+  }
+  return { sections, df, avgLength: sections.length ? total / sections.length : 1, pages, keywords };
 }
 
 export async function loadIndex(base = config.docsUrl(), previous?: DocsIndex | null): Promise<DocsIndex> {
   const locales: Partial<Record<Locale, LocaleIndex>> = {};
   const fresh: Locale[] = [];
   for (const locale of LOCALES) {
-    const list = await fetchText(locale === "en" ? `${base}/llms.txt` : `${base}/${locale}/llms.txt`, MAX_INDEX_BYTES);
+    const prefix = locale === "en" ? base : `${base}/${locale}`;
+    const [list, keywords] = await Promise.all([fetchText(`${prefix}/llms.txt`, MAX_INDEX_BYTES), fetchText(`${prefix}/keywords.json`, MAX_KEYWORDS_BYTES)]);
     const entries = list ? parseLlms(list, base, locale) : [];
     const pages = await pool(entries, CONCURRENCY, async (e) => {
       const md = await fetchText(e.mdUrl, MAX_PAGE_BYTES);
@@ -237,13 +277,16 @@ export async function loadIndex(base = config.docsUrl(), previous?: DocsIndex | 
     const loaded = pages.filter((p) => p.length).length;
     // A language that failed to load keeps its previous sections.
     if (loaded) {
-      locales[locale] = buildLocale(pages.flat(), loaded);
+      locales[locale] = buildLocale(pages.flat(), loaded, parseKeywords(keywords));
       fresh.push(locale);
     }
     else if (previous?.base === base && previous.locales[locale]) locales[locale] = previous.locales[locale];
   }
   const vocabulary = new Set<string>();
-  for (const l of Object.values(locales)) for (const t of l!.df.keys()) vocabulary.add(t);
+  for (const l of Object.values(locales)) {
+    for (const t of l!.df.keys()) vocabulary.add(t);
+    for (const tf of l!.keywords.values()) for (const t of tf.keys()) vocabulary.add(t);
+  }
   return { loadedAt: now(), base, locales, vocabulary, fresh };
 }
 
@@ -308,6 +351,9 @@ export const docsLoaded = () => sectionCount(state().index) > 0;
 export type Hit = { section: Section; score: number };
 const K1 = 1.2;
 const B = 0.75;
+// How much a page's keywords count against a section's own text (whose
+// title and heading already weigh 2 and 3).
+const KEYWORD_WEIGHT = 0.5;
 
 export function rank(index: DocsIndex, query: string, locale: Locale, page?: string): Hit[] {
   const l = index.locales[locale] ?? index.locales[locale === "de" ? "en" : "de"];
@@ -319,14 +365,32 @@ export function rank(index: DocsIndex, query: string, locale: Locale, page?: str
   const n = l.sections.length;
   const idf = new Map([...q.keys()].map((t) => [t, Math.log(1 + (n - (l.df.get(t) ?? 0) + 0.5) / ((l.df.get(t) ?? 0) + 0.5))]));
   const phrase = fold(query).replace(/\s+/g, " ").trim();
+  // A page's keywords as a field of their own: the terms' weight from the
+  // sections, saturated like BM25 (no length normalisation, the lists are
+  // short). They count for the page's intro and for each of its sections
+  // that matches the question itself – so they lift the page, and its text
+  // still decides which section.
+  const kwScores = new Map<string, number>();
+  for (const [slug, tf] of l.keywords) {
+    let score = 0;
+    for (const [t, weight] of q) {
+      const f = tf.get(t);
+      if (!f) continue;
+      score += weight * idf.get(t)! * ((f * (K1 + 1)) / (f + K1));
+    }
+    if (score) kwScores.set(slug, score * KEYWORD_WEIGHT);
+  }
   const hits: Hit[] = [];
   for (const section of l.sections) {
     let score = 0;
     for (const [t, weight] of q) {
       const tf = section.tf.get(t);
       if (!tf) continue;
-      score += weight * idf.get(t)! * ((tf * (K1 + 1)) / (tf + K1 * (1 - B + (B * section.length) / l.avgLength)));
+      // A section shorter than half the average counts as half the average:
+      // a one-line intro does not outrank a full section only for being short.
+      score += weight * idf.get(t)! * ((tf * (K1 + 1)) / (tf + K1 * (1 - B + (B * Math.max(section.length, l.avgLength / 2)) / l.avgLength)));
     }
+    if (score || section.intro) score += kwScores.get(section.slug) ?? 0;
     if (!score) continue;
     if (phrase.length >= 8 && phrase.split(" ").length >= 2 && fold(section.text).includes(phrase)) score *= 1.3;
     if (page && section.slug === page) score *= 1.25;
