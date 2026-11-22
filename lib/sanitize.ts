@@ -155,3 +155,20 @@ export function linksIn(answer: string) {
   for (const m of answer.matchAll(/\]\((https?:\/\/[^)\s]+)\)|(?<![(\w])(https?:\/\/[^\s)\]]+)/g)) out.push((m[1] || m[2]).replace(/[.,;:!?]+$/, ""));
   return [...new Set(out)];
 }
+
+// One short text of an insight summary (a topic, a question, a note):
+// the same rules as an answer (no HTML, links only to the allow-list,
+// mentions defused, invisible characters out), then on one line, without
+// Markdown emphasis or code fences, at most `max` characters.
+export function sanitizeInsightText(input: unknown, max: number): string {
+  if (typeof input !== "string") return "";
+  const clean = sanitizeAnswer(input.slice(0, 4 * max), "en")
+    .replace(/```[a-z0-9+#.-]*/gi, " ")
+    .replace(/\*\*|__|(?<![\w*])\*(?!\s)|(?<!\s)\*(?![\w*])/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (clean.length <= max) return clean;
+  const cut = clean.slice(0, max - 2);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > max / 2 ? cut.slice(0, space) : cut).replace(/\[[^\]]*(\]\([^)]*)?$/, "").trimEnd()} …`;
+}

@@ -29,8 +29,14 @@ function totals(where: string, ...args: (string | number)[]): Totals {
   const row = one<{ questions: number; nano: number }>(`SELECT COUNT(*) AS questions, ${SPENT} AS nano FROM questions WHERE ${where}`, ...args);
   return { questions: row?.questions ?? 0, nano: row?.nano ?? 0 };
 }
-const monthTotals = (at: number) => totals("month=?", monthKey(at));
-const dayTotals = (at: number) => totals("day=?", dayKey(at));
+// What the insight summaries spent (their own calls, lib/insights.ts): part
+// of the global cost and the budget, never of anyone's question counts.
+export function insightsNano(column: "month" | "day", key: string) {
+  return one<{ nano: number }>(`SELECT ${SPENT} AS nano FROM insights WHERE ${column}=?`, key)?.nano ?? 0;
+}
+const withInsights = (t: Totals, column: "month" | "day", key: string): Totals => ({ questions: t.questions, nano: t.nano + insightsNano(column, key) });
+const monthTotals = (at: number) => withInsights(totals("month=?", monthKey(at)), "month", monthKey(at));
+const dayTotals = (at: number) => withInsights(totals("day=?", dayKey(at)), "day", dayKey(at));
 
 // When a sliding window has room again: the oldest question in it leaves.
 function windowRetry(column: "subject" | "ip_key", key: string, since: number, windowMs: number) {
@@ -179,8 +185,121 @@ export function reservedNano(id: number) {
 export function settleStale(at = now(), olderThanMs = 10 * MINUTE) {
   const stale = all<{ id: number; reserved_nano: number }>("SELECT id,reserved_nano FROM questions WHERE status='pending' AND at<?", at - olderThanMs);
   for (const q of stale) settle(q.id, { status: "error", costNano: q.reserved_nano }, at);
-  return stale.length;
+  const staleInsights = all<{ id: number; reserved_nano: number }>("SELECT id,reserved_nano FROM insights WHERE status='pending' AND created_at<?", at - olderThanMs);
+  for (const q of staleInsights) settleInsight(q.id, { status: "error", error: "interrupted", costNano: q.reserved_nano }, at);
+  return stale.length + staleInsights.length;
 }
+
+// ---- the insight summaries (lib/insights.ts) ------------------------------
+// A summary is not a question: it has its own row in `insights` and its own
+// reservation, but the same rule – its maximum possible cost is reserved in
+// one BEGIN IMMEDIATE transaction with the checks (the monthly budget and
+// the global cost limits, which it shares with the questions), and settled
+// from the usage afterwards. The same transaction is the guard against
+// parallel runs (one pending summary at a time, across processes) and makes
+// a scheduled period run once (the unique period).
+
+export type InsightReservation = {
+  settings: Settings;
+  model: ModelId;
+  ceilingNano: number;
+  kind: "scheduled" | "manual";
+  interval: "daily" | "weekly";
+  period: string | null;
+  fromAt: number;
+  toAt: number;
+  counts: { questions: number; sent: number; unanswered: number; refused: number };
+  actor?: string;
+  at?: number;
+};
+export type InsightReserved = { id: number } | { skipped: "busy" | "done" };
+
+// The first limit a summary of `cost` would break (the budget, the global cost), or null.
+function insightBreach(settings: Settings, cost: number, at: number): { scope: LimitScope; retryAt: number } | null {
+  const month = monthTotals(at);
+  const budget = nano(settings.monthlyBudgetUsd);
+  if (budget <= 0 || month.nano + cost > budget) return { scope: "budget", retryAt: nextMonth(at) };
+  const g = settings.limits.global;
+  if (g.costPerMonthUsd > 0 && month.nano + cost > nano(g.costPerMonthUsd)) return { scope: "global", retryAt: nextMonth(at) };
+  if (g.costPerDayUsd > 0 && dayTotals(at).nano + cost > nano(g.costPerDayUsd)) return { scope: "global", retryAt: nextDay(at) };
+  return null;
+}
+
+// Records a summary row: 'pending' with its reserved cost when ceilingNano
+// > 0 (a model call follows), else directly 'empty' (nothing to summarise,
+// nothing spent). Throws LimitError when the budget or a global cost limit
+// leaves no room.
+export function reserveInsight(input: InsightReservation): InsightReserved {
+  const at = input.at ?? now();
+  const result = transaction((): InsightReserved | { scope: LimitScope; retryAt: number } => {
+    if (one("SELECT id FROM insights WHERE status='pending'")) return { skipped: "busy" };
+    if (input.period && one("SELECT id FROM insights WHERE period=?", input.period)) return { skipped: "done" };
+    const call = input.ceilingNano > 0;
+    if (call) {
+      const breach = insightBreach(input.settings, input.ceilingNano, at);
+      if (breach) return breach;
+    }
+    const r = run(
+      `INSERT INTO insights(created_at,day,month,kind,interval,period,period_key,from_at,to_at,status,model,questions,sent,unanswered,refused,actor,reserved_nano,ceiling_nano,settled_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      at,
+      dayKey(at),
+      monthKey(at),
+      input.kind,
+      input.interval,
+      input.period,
+      input.period ?? "",
+      input.fromAt,
+      input.toAt,
+      call ? "pending" : "empty",
+      call ? input.model : "",
+      input.counts.questions,
+      input.counts.sent,
+      input.counts.unanswered,
+      input.counts.refused,
+      (input.actor ?? "").slice(0, 100),
+      call ? input.ceilingNano : 0,
+      call ? input.ceilingNano : 0,
+      call ? null : at,
+    );
+    return { id: Number(r.lastInsertRowid) };
+  });
+  if ("scope" in result) throw new LimitError(result.scope, result.retryAt);
+  return result;
+}
+
+export type InsightOutcome = {
+  status: "ok" | "error";
+  costNano: number;
+  error?: string;
+  result?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  latencyMs?: number;
+};
+// Replaces a summary's reservation by its real cost (and stores its result).
+// A failed scheduled run gives its period free again, so a later tick can retry.
+export function settleInsight(id: number, o: InsightOutcome, at = now()) {
+  run(
+    `UPDATE insights SET status=?, error=?, result=?, cost_nano=?, reserved_nano=0, input_tokens=?, output_tokens=?, latency_ms=?, settled_at=?,
+       period=CASE WHEN ?='error' THEN NULL ELSE period END
+     WHERE id=? AND status='pending'`,
+    o.status,
+    (o.error ?? "").slice(0, 40),
+    o.status === "ok" ? (o.result ?? "") : "",
+    Math.max(0, Math.round(o.costNano)),
+    o.inputTokens ?? 0,
+    o.outputTokens ?? 0,
+    o.latencyMs ?? null,
+    at,
+    o.status,
+    id,
+  );
+}
+
+// The worst case reserved for a pending summary (0 once settled).
+export const insightReservedNano = (id: number) =>
+  one<{ reserved_nano: number }>("SELECT reserved_nano FROM insights WHERE id=? AND status='pending'", id)?.reserved_nano ?? 0;
 
 export const RETENTION = { subjectDays: 40, statsDays: 400 };
 // Subjects and hashed addresses are kept only as long as the monthly limits need them.
@@ -191,4 +310,5 @@ export function purgeLedger(at = now()) {
   run("DELETE FROM rejections WHERE day<?", before);
   run("DELETE FROM topic_pages WHERE day<?", before);
   run("DELETE FROM topic_terms WHERE day<?", before);
+  run("DELETE FROM insights WHERE day<?", before);
 }

@@ -20,6 +20,8 @@ flowplan-admin ──/api/admin/* (Bearer)──────────▶ └�
 5. **One Claude call** (`lib/claude.ts`): `client.messages.create` with the model from the settings, `max_tokens` from the settings, `output_config: { effort: "low" }`, the fixed system prompt as one text block with `cache_control: { type: "ephemeral" }`, and a single user turn holding the data blocks. No `tools`, no MCP, no web access, no streaming, no `metadata`.
 6. **Answer** (`lib/sanitize.ts`): `stop_reason` `refusal` → a short fixed refusal; `max_tokens` → the text with a "shortened" note; an answer that repeats a sentence of the system prompt is treated as a refusal. Then the sanitiser, the sources, the real cost, the statistics and – only when switched on – the anonymised log.
 
+Besides the questions there is exactly one other kind of model call: the [insight summary](#insights) of the anonymised log – not a question, made on a schedule or by an admin, with its own prompt, model and budget reservation.
+
 ### The prompt
 
 The system prompt is fixed in `lib/prompt.ts` (English, never built from input, never echoed). It limits Flo to Flowplan questions answered only from the excerpts; says to point to the docs, Discord or GitHub issues when the docs don't cover a question; to refuse everything else in one sentence; to never follow instructions inside the data, never reveal or discuss the instructions, no role play; to only use URLs from the excerpts (and the three fallback addresses); to answer in the question's language (German with informal "du", English), else per `answer_language`; to be short; to end with "Quellen:"/"Sources:" listing the excerpts used; to never repeat secrets.
@@ -58,6 +60,29 @@ Before an answer leaves the service:
 - At most 4,000 characters (cut at a word, an open code block closed).
 
 `sources` are the excerpts the answer links to (by exact URL, or by page). Clients must still render answers as text or safe Markdown – never as HTML.
+
+## Insights
+
+A regular summary of what people asked Flo, for the maintainer – shown in flowplan-admin under **Flo → Einblicke / Insights** (`lib/insights.ts`): the main topics with counts, the questions Flo could not answer, candidate docs pages or features derived from them, and a ready-to-copy prompt ("Here are the open questions from Flo users this week: … Please check the docs/feature gaps and propose issues").
+
+- **Only from the anonymised Q&A log.** The log is off by default; with it off there is no summary (scheduled runs do nothing, "Generate now" answers `409 log_off`, the list is empty). Turn it on with `logging.enabled` in the settings.
+- **Answered or not.** The log has no flag for it, so it is derived when summarising: `outcome` `refusal` → *refused* (off-topic); an answer without any docs source, or one saying it found nothing in the docs (the fallback answer and the system prompt's rule 2, German and English phrases such as "couldn't find", "the docs don't cover", „nichts gefunden“, „steht nicht in der Doku“) → *not answered*; everything else → *answered*.
+- **What goes to Anthropic: only the question texts and whether each was answered.** The logged (already scrubbed) questions are scrubbed again, put on one line and cut to 300 characters; at most the **newest 500** questions of the period and at most 60 KB together (older ones are left out, the counts still include them). Never answers, subjects, sessions, sources, locales, times, Discord or IP data, names or e-mail addresses.
+- **Its own call** (`lib/claude.ts` `summarizeClaude`): `client.messages.create` with `settings.insights.model` (from the same allow-list, default `claude-haiku-5-5`), `max_tokens` 4000, `output_config: { effort: "low", format: { type: "json_schema", … } }`, the fixed system prompt of `lib/prompt-insights.ts` (no prompt cache – it runs at most a few times a day) and one user turn holding the data. No `tools`, no MCP, no web access, no streaming, no `metadata`. The questions are data in a delimited block (`<` `>` become `‹` `›`):
+
+  ```
+  period: 2026-11-21 · questions in the period: 132 · given below: 132 (the newest)
+
+  <questions>
+  <q n="1" answered="no">Can Flowplan sync with Outlook?</q>
+  <q n="2" answered="yes">How do backups work?</q>
+  </questions>
+  ```
+- **Its own budget reservation** (`lib/limits.ts` `reserveInsight` / `settleInsight`): in one `BEGIN IMMEDIATE` transaction the monthly budget and the global cost limits (per day and month) are checked and the summary's **maximum cost** is reserved (every prompt byte at the cache-write price plus 4000 output tokens); afterwards the real cost from `usage` replaces it. Summaries count against the budget and the global cost limits like questions do, but never as questions (no question counts, no per-person limits); `/api/admin/summary` shows them as `month.insightsCostUsd`. A failed call costs nothing unless it may have been billed (timeout, dropped connection: the reserved worst case); a summary that died with the process is settled like that by the hourly clean-up.
+- **The answer is untrusted text**: parsed as JSON (a code fence or text around the object is tolerated), at most 12 topics, 25 unanswered questions and 12 ideas, counts whole numbers between 0 and the number of questions, unknown fields dropped; every string passes the answer sanitiser (no HTML, links only to the allow-list, mentions defused) and the log's scrubber, on one line and bounded. No usable JSON (or a refusal, or `max_tokens`) → the summary is stored as failed (`invalid_answer`, `refusal`, `max_tokens`), its cost still counted.
+- **Schedule** (`insights.interval`: `off` | `daily` (default) | `weekly`): an in-process timer (started with the server in `instrumentation.ts`, every 10 minutes) summarises the previous full period once – the UTC day, or the ISO week Monday to Sunday – shortly after it ends. Idempotent per period (a unique period in the table), one summary at a time (a pending one blocks every other, also across processes), a failed period is tried again on later ticks at most 3 times. A day without questions is stored as `empty` (no call, nothing spent). **Generate now** (`POST /api/admin/insights`) summarises the last 24 hours (daily) or 7 days (weekly or off).
+- **Retention**: the summaries quote questions, so their content follows the log – it is cleared after `logging.retentionDays` and all of it when logging is turned off; the rows (cost, counts) stay for the budget and the statistics (400 days).
+- **Cost** (Haiku 5.5 at $0.10 / $0.50 per million tokens): a typical daily summary of ~100–500 short questions is about 3,000–20,000 input and 1,000–2,000 output tokens, **≈ $0.001–0.003** (a month of daily summaries ≈ $0.05); the reserved worst case of a full 500-question prompt is about $0.01. With Sonnet 5.5 about 20×, with Opus 5.5 about 40× that.
 
 ## Public API
 
@@ -133,6 +158,7 @@ All in the settings (admin). Counted only here, in SQLite, atomically (see "How 
 - **Per subject** (a Discord user or a docs session): questions per minute and hour (sliding windows), per day and month (UTC calendar), and cost per day and month (USD).
 - **Per hashed address** (docs, a fallback against new sessions per question): the subject's per-minute, -hour and -day counts × 3.
 - **Global**: questions and cost per day and per month.
+- **Insight summaries** count with their cost against the budget and the global cost limits (never as questions; see [Insights](#insights)).
 - **Hard monthly budget** (USD): reached → every question gets 429 `budget` and `/api/status` turns false, until the next month (automatically, nothing to reset) or a raised budget (at once). A budget of 0 stops everything. The **warning threshold** (default 80 %) is shown in the admin summary.
 - **Block list**: subjects (stored as HMACs; the admin sees a 12-character short hash and when it was last seen).
 
@@ -167,11 +193,12 @@ For flowplan-admin (server to server): every request needs `Authorization: Beare
   "monthlyBudgetUsd": 20,                 // 0–10000 (0 stops everything)
   "warnAtPercent": 80,                    // 1–100
   "discord": { "channelIds": [], "roleIds": [], "onLimit": "message" }, // ids: 17–20 digits, ≤ 50 each; empty = any; onLimit: message | readonly
-  "logging": { "enabled": false, "retentionDays": 30 } // 1–365
+  "logging": { "enabled": false, "retentionDays": 30 }, // 1–365
+  "insights": { "interval": "daily", "model": "claude-haiku-5-5" } // interval: off | daily | weekly; model from the allow-list
 }
 ```
 
-`PUT` takes `{ "settings": { … }, "actor": "yannic" }` and returns the stored settings. Fields left out keep their value, unknown fields are ignored; a value out of range rejects the whole PUT with `400 { error: "invalid_settings", errors: ["maxTokens: integer 100–4000", …] }`. Turning logging off deletes the log. (The audit log is flowplan-admin's own.)
+`PUT` takes `{ "settings": { … }, "actor": "yannic" }` and returns the stored settings. Fields left out keep their value, unknown fields are ignored; a value out of range rejects the whole PUT with `400 { error: "invalid_settings", errors: ["maxTokens: integer 100–4000", …] }`. Turning logging off deletes the log and the insights' content. (The audit log is flowplan-admin's own.)
 
 ### `GET /api/admin/summary`
 
@@ -187,7 +214,7 @@ For flowplan-admin (server to server): every request needs `Authorization: Beare
 }
 ```
 
-`inputTokens` = input + cache read + cache write tokens. `costUsd` includes reservations of questions still in flight (as the budget does).
+`inputTokens` = input + cache read + cache write tokens. `costUsd` includes reservations of questions still in flight (as the budget does). `month.costUsd` and `month.percent` also include the [insight summaries](#insights) (they count against the budget), shown on their own as `month.insightsCostUsd`; `today`, `bySource` and `/usage` are questions only.
 
 ### `GET /api/admin/usage?from=&to=&granularity=day`
 
@@ -217,6 +244,33 @@ For flowplan-admin (server to server): every request needs `Authorization: Beare
 
 Newest first, `limit` 1–500 (default 100). With logging off: `{ "enabled": false, "entries": [] }`. Entries are anonymised: no subject, no session, no Discord or IP data; e-mail addresses, phone numbers, IP addresses and long tokens in the text are masked.
 
+### `GET · POST /api/admin/insights`
+
+The [insight summaries](#insights).
+
+- `GET /api/admin/insights?limit=` (1–100, default 30) → newest first, without the content:
+
+  ```jsonc
+  {
+    "enabled": true,               // false while the Q&A log is off – then "entries" is empty
+    "interval": "daily", "model": "claude-haiku-5-5", "retentionDays": 30, "maxQuestions": 500,
+    "running": false,              // a summary is being generated
+    "nextRunAt": "2026-11-23T00:00:00.000Z", // null when off or the log is off
+    "entries": [{ "id": 12, "createdAt": "…", "kind": "scheduled", "interval": "daily", "period": "2026-11-21",
+                  "label": "2026-11-21", "from": "…", "to": "…",
+                  "status": "ok",          // pending | ok | empty (no questions, no call) | error
+                  "error": null,           // upstream | invalid_answer | max_tokens | refusal | interrupted
+                  "model": "claude-haiku-5-5", "questions": 132, "sent": 132, "unanswered": 9, "refused": 2,
+                  "costUsd": 0.0021, "inputTokens": 14200, "outputTokens": 1300, "latencyMs": 9800,
+                  "topTopics": ["Database views", "Self-hosting", "Formulas"], "ideas": 3 }]
+  }
+  ```
+  `kind` is `scheduled` or `manual`; `period` is `YYYY-MM-DD` or `YYYY-Www` (ISO week) for scheduled ones, null for manual ones; `label` is the period as shown (a date or `from – to`).
+- `GET /api/admin/insights?id=12` → `{ "entry": { …the fields above without topTopics/ideas…, "result": { "topics": [{ "title", "count" }], "unanswered": [{ "question", "count", "note" }], "ideas": [{ "kind": "docs" | "feature", "title", "detail" }] } | null, "prompt": "Here are the open questions from Flo users …" | null } }`; 404 `not_found` (also once its content is purged), 400 `invalid_id`.
+- `POST /api/admin/insights` `{ "actor": "yannic" }` – **Generate now**, synchronous (up to about a minute) → `{ "entry": { … as with ?id= } }` (status `ok`, `empty` or `error`). Errors: 409 `log_off` (the Q&A log is off), 409 `busy` (one is running), 503 `off` (no API key), 429 `{ error: "limit", scope: "budget" | "global" }`, 502 `upstream`.
+
+The interval and the model are part of the settings (`insights`).
+
 ### `GET /api/admin/export?format=csv&from=&to=`
 
 The daily usage (fields as in `/usage`) as a CSV download: header line, RFC 4180 quoting, CRLF; cells starting with `= + - @` get a leading `'`.
@@ -224,12 +278,12 @@ The daily usage (fields as in `/usage`) as a CSV download: header line, RFC 4180
 ## Security and privacy
 
 - **Secrets only from the environment**: `ANTHROPIC_API_KEY` is read by the SDK (`new Anthropic()`), never logged, never returned; failed API calls are logged only as status, error type and request id – never the message or headers. `ASK_ADMIN_TOKEN` and `ASK_BOT_TOKEN` must be at least 24 characters, are compared in constant time and must differ. `ASK_SECRET` (or a key generated once into the data directory, mode 600) signs session tokens and challenges and keys every HMAC.
-- **Nothing personal goes to Anthropic**: only the question, the bounded conversation and doc excerpts. No names, Discord ids, channel or role ids, IP addresses, session tokens or subjects; no `metadata.user_id`.
+- **Nothing personal goes to Anthropic**: only the question, the bounded conversation and doc excerpts. No names, Discord ids, channel or role ids, IP addresses, session tokens or subjects; no `metadata.user_id`. The insight summary gets only the scrubbed question texts of the anonymised log and whether each was answered.
 - **Prompt injection**: question, conversation and docs are delimited data; the system prompt forbids following instructions in them, revealing itself, role play and non-Flowplan topics; and whatever the model returns passes the sanitiser and the prompt-leak check. The model has no tools, so an injection can at most change the text of one answer.
 - **Abuse**: proof-of-work sessions, per-subject, per-address, global and budget limits, the block list, body size and length limits, 2-hour sessions. The SDK retries a failed call at most once (45 s timeout); a request that died with the process keeps its reserved cost.
 - **No IP addresses stored**: addresses are used only through `ipKey()`, a daily rotating HMAC. Subjects are HMACs and are emptied from the ledger after 40 days (the counts stay for the statistics, 400 days).
 - **No cookies, no tracking**, no external fonts or scripts. A strict Content Security Policy on the page (`proxy.ts`): scripts only with the per-request nonce, no inline scripts or style attributes, no framing, no external hosts.
-- **Logging is off by default.** When on: anonymised (see the log above), deleted after `retentionDays` (checked hourly), all deleted when turned off. The landing page says whether it is on.
+- **Logging is off by default.** When on: anonymised (see the log above), deleted after `retentionDays` (checked hourly), all deleted when turned off – the insights' content with it. The landing page says whether it is on.
 - Notice shown to people (docs panel and `/ask`): „Deine Frage geht an Anthropic (Claude) und wird nur aus den öffentlichen Docs beantwortet.“ / "Your question goes to Anthropic (Claude) and is answered only from the public docs."
 
 ## Environment variables

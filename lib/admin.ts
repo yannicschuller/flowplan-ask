@@ -15,6 +15,8 @@ import { DAY, dayKey, monthKey, now } from "./clock";
 import { block, listBlocked, unblock } from "./subjects";
 import { topics } from "./topics";
 import { purgeLog, readLog } from "./qalog";
+import { listInsights, purgeInsights, readInsight, runInsights } from "./insights";
+import { insightsNano } from "./limits";
 import type { Source } from "./limits";
 
 export function requireAdmin(request: Request) {
@@ -48,6 +50,8 @@ export function adminSummary(at = now()) {
   const state = serviceState(settings, at);
   const month = monthKey(at);
   const m = agg("month=?", month);
+  // The insight summaries count against the budget too (not as questions).
+  const insightsMonth = insightsNano("month", month);
   const budgetUsd = settings.monthlyBudgetUsd;
   const rejected = { subject: 0, global: 0, budget: 0, off: 0 };
   for (const r of all<{ scope: keyof typeof rejected; n: number }>("SELECT scope, SUM(count) AS n FROM rejections WHERE substr(day,1,7)=? GROUP BY scope", month))
@@ -57,8 +61,10 @@ export function adminSummary(at = now()) {
     status: { docs: state.docs, discord: state.discord, budgetReached: state.budgetReached, warn: state.warn },
     month: {
       ...totals(m),
+      costUsd: usd(m.nano + insightsMonth),
+      insightsCostUsd: usd(insightsMonth),
       budgetUsd,
-      percent: budgetUsd > 0 ? Math.round((usd(m.nano) / budgetUsd) * 1000) / 10 : 100,
+      percent: budgetUsd > 0 ? Math.round((usd(m.nano + insightsMonth) / budgetUsd) * 1000) / 10 : 100,
     },
     today: totals(agg("day=?", dayKey(at))),
     bySource: {
@@ -156,6 +162,7 @@ export async function adminRoute(request: Request, name: string) {
       const actor = typeof body.actor === "string" ? body.actor.trim().slice(0, 100) : "";
       const saved = saveSettings(body.settings, actor);
       purgeLog(saved);
+      purgeInsights(saved);
       return json(saved);
     }
     case "summary":
@@ -184,6 +191,21 @@ export async function adminRoute(request: Request, name: string) {
       only("GET");
       const r = dateRange(params);
       return json(readLog(getSettings(), params, { from: r.fromMs, to: r.toMs }));
+    }
+    case "insights": {
+      only("GET", "POST");
+      if (method === "GET") {
+        const id = params.get("id");
+        if (id === null) return json(listInsights(params));
+        if (!/^\d{1,12}$/.test(id)) throw new HttpError(400, "invalid_id", "id must be a number.");
+        return json({ entry: readInsight(Number(id)) });
+      }
+      // "Generate now": synchronous, one at a time (409 busy), only with the log on (409 log_off).
+      const body = await readJson(request, 4096, true);
+      const actor = typeof body.actor === "string" ? body.actor.trim().slice(0, 100) : "";
+      const r = await runInsights({ kind: "manual", actor });
+      if (!("id" in r)) throw new HttpError(409, "busy", "A summary is being generated right now.");
+      return json({ entry: readInsight(r.id) });
     }
     case "export": {
       only("GET");

@@ -22,7 +22,11 @@ export type Settings = {
   warnAtPercent: number;
   discord: { channelIds: string[]; roleIds: string[]; onLimit: "message" | "readonly" };
   logging: { enabled: boolean; retentionDays: number };
+  // The regular summary of the Q&A log (lib/insights.ts): how often, and its own model.
+  insights: { interval: InsightsInterval; model: ModelId };
 };
+export type InsightsInterval = "off" | "daily" | "weekly";
+export const INSIGHTS_INTERVALS: InsightsInterval[] = ["off", "daily", "weekly"];
 
 export const DEFAULT_SETTINGS: Settings = {
   enabled: { global: true, docs: true, discord: true },
@@ -39,6 +43,7 @@ export const DEFAULT_SETTINGS: Settings = {
   warnAtPercent: 80,
   discord: { channelIds: [], roleIds: [], onLimit: "message" },
   logging: { enabled: false, retentionDays: 30 },
+  insights: { interval: "daily", model: DEFAULT_MODEL },
 };
 
 // Ranges (the same as flowplan-admin's form). Every count and cost limit
@@ -119,6 +124,16 @@ export function mergeSettings(base: Settings, input: unknown): Settings {
   if (model !== undefined) {
     if (!isModel(model)) errors.push(`model: one of ${Object.keys(MODELS).join(", ")}`);
     else out.model = model;
+  }
+  const insightsModel = get(input, "insights.model");
+  if (insightsModel !== undefined) {
+    if (!isModel(insightsModel)) errors.push(`insights.model: one of ${Object.keys(MODELS).join(", ")}`);
+    else set(out, "insights.model", insightsModel);
+  }
+  const interval = get(input, "insights.interval");
+  if (interval !== undefined) {
+    if (!INSIGHTS_INTERVALS.includes(interval as InsightsInterval)) errors.push(`insights.interval: ${INSIGHTS_INTERVALS.join(", ")}`);
+    else set(out, "insights.interval", interval);
   }
   const onLimit = get(input, "discord.onLimit");
   if (onLimit !== undefined) {

@@ -103,6 +103,48 @@ const MIGRATIONS: string[] = [
      id TEXT PRIMARY KEY,
      expires_at INTEGER NOT NULL
    );`,
+  // 2: insights – the regular summaries of the anonymised Q&A log
+  // (lib/insights.ts). A row is also the summary call's entry in the
+  // budget: 'pending' with the reserved (maximum) cost while the call runs,
+  // then the real cost from the usage. period is the scheduled run's period
+  // ('2026-11-21' or '2026-W47'), unique so a period is summarised once;
+  // it is emptied when that run failed (period_key keeps it, for the retry
+  // count). result holds the sanitised JSON (topics, unanswered, ideas);
+  // it is cleared (purged=1) with the log's retention or when logging is
+  // turned off, while the cost stays for the budget and the statistics.
+  `CREATE TABLE insights (
+     id INTEGER PRIMARY KEY,
+     created_at INTEGER NOT NULL,
+     day TEXT NOT NULL,
+     month TEXT NOT NULL,
+     kind TEXT NOT NULL CHECK (kind IN ('scheduled','manual')),
+     interval TEXT NOT NULL CHECK (interval IN ('daily','weekly')),
+     period TEXT,
+     period_key TEXT NOT NULL DEFAULT '',
+     from_at INTEGER NOT NULL,
+     to_at INTEGER NOT NULL,
+     status TEXT NOT NULL CHECK (status IN ('pending','ok','empty','error')),
+     error TEXT NOT NULL DEFAULT '',
+     model TEXT NOT NULL DEFAULT '',
+     questions INTEGER NOT NULL DEFAULT 0,
+     sent INTEGER NOT NULL DEFAULT 0,
+     unanswered INTEGER NOT NULL DEFAULT 0,
+     refused INTEGER NOT NULL DEFAULT 0,
+     result TEXT NOT NULL DEFAULT '',
+     purged INTEGER NOT NULL DEFAULT 0,
+     actor TEXT NOT NULL DEFAULT '',
+     reserved_nano INTEGER NOT NULL DEFAULT 0,
+     ceiling_nano INTEGER NOT NULL DEFAULT 0,
+     cost_nano INTEGER NOT NULL DEFAULT 0,
+     input_tokens INTEGER NOT NULL DEFAULT 0,
+     output_tokens INTEGER NOT NULL DEFAULT 0,
+     latency_ms INTEGER,
+     settled_at INTEGER
+   );
+   CREATE UNIQUE INDEX insights_period ON insights(period) WHERE period IS NOT NULL;
+   CREATE INDEX insights_month ON insights(month);
+   CREATE INDEX insights_day ON insights(day);
+   CREATE INDEX insights_pending ON insights(status) WHERE status = 'pending';`,
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
