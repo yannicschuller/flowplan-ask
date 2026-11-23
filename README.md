@@ -77,10 +77,19 @@ A regular summary of what people asked Flo, for the maintainer – shown in flow
   <q n="1" answered="no">Can Flowplan sync with Outlook?</q>
   <q n="2" answered="yes">How do backups work?</q>
   </questions>
+
+  <handled_topics>
+  <t n="1" status="done">CalDAV – note: Docs page views#sync-both-ways-caldav</t>
+  </handled_topics>
   ```
+
+  The `<handled_topics>` block is there only when the maintainer has [handled topics](#handled-marks-and-handled-topics).
 - **Its own budget reservation** (`lib/limits.ts` `reserveInsight` / `settleInsight`): in one `BEGIN IMMEDIATE` transaction the monthly budget and the global cost limits (per day and month) are checked and the summary's **maximum cost** is reserved (every prompt byte at the cache-write price plus 4000 output tokens); afterwards the real cost from `usage` replaces it. Summaries count against the budget and the global cost limits like questions do, but never as questions (no question counts, no per-person limits); `/api/admin/summary` shows them as `month.insightsCostUsd`. A failed call costs nothing unless it may have been billed (timeout, dropped connection: the reserved worst case); a summary that died with the process is settled like that by the hourly clean-up.
-- **The answer is untrusted text**: parsed as JSON (a code fence or text around the object is tolerated), at most 12 topics, 25 unanswered questions and 12 ideas, counts whole numbers between 0 and the number of questions, unknown fields dropped; every string passes the answer sanitiser (no HTML, links only to the allow-list, mentions defused) and the log's scrubber, on one line and bounded. No usable JSON (or a refusal, or `max_tokens`) → the summary is stored as failed (`invalid_answer`, `refusal`, `max_tokens`), its cost still counted.
-- **Schedule** (`insights.interval`: `off` | `daily` (default) | `weekly`): an in-process timer (started with the server in `instrumentation.ts`, every 10 minutes) summarises the previous full period once – the UTC day, or the ISO week Monday to Sunday – shortly after it ends. Idempotent per period (a unique period in the table), one summary at a time (a pending one blocks every other, also across processes), a failed period is tried again on later ticks at most 3 times. A day without questions is stored as `empty` (no call, nothing spent). **Generate now** (`POST /api/admin/insights`) summarises the last 24 hours (daily) or 7 days (weekly or off).
+- **The answer is untrusted text**: parsed as JSON (a code fence or text around the object is tolerated), at most 12 topics, 25 unanswered questions, 12 ideas and 12 still-open handled topics, counts whole numbers between 0 and the number of questions, unknown fields dropped; every string passes the answer sanitiser (no HTML, links only to the allow-list, mentions defused) and the log's scrubber, on one line and bounded. No usable JSON (or a refusal, or `max_tokens`) → the summary is stored as failed (`invalid_answer`, `refusal`, `max_tokens`), its cost still counted.
+- **Schedule** (`insights.interval`: `off` | `daily` (default) | `weekly`): an in-process timer (started with the server in `instrumentation.ts`, every 10 minutes) summarises the previous full period once – the UTC day, or the ISO week Monday to Sunday – shortly after it ends. Idempotent per period (a unique period in the table), one summary at a time (a pending one blocks every other, also across processes), a failed period is tried again on later ticks at most 3 times. A day without questions is stored as `empty` (no call, nothing spent). **Generate now** (`POST /api/admin/insights`) summarises the questions since the end of the newest summary [marked as handled](#handled-marks-and-handled-topics) – at most the last 30 days; without any mark the last 24 hours (daily) or 7 days (weekly or off). Scheduled runs always summarise their period, whatever is marked. The question limits (newest 500, 60 KB) apply to every window.
+- <a id="handled-marks-and-handled-topics"></a>**Handled marks and handled topics** – so the summaries stop repeating what the maintainer already dealt with:
+  - **Mark a summary as handled** (`POST /api/admin/insight-handled`, stores `handled_at` and who): "Generate now" then starts where the newest marked summary ended (its `to`; at most 30 days back – older marks give the last 30 days, `basis: "capped"`). Only finished summaries (`ok`, `empty`) can be marked; taking the mark away goes back to the default window.
+  - **Handled topics** (`/api/admin/handled-topics`, at most 100): a title (1–80 characters), `done` (the docs or Flowplan were changed for it) or `not_a_topic` (decided not to cover it), and an optional note (at most 200 characters), e.g. "CalDAV" – "Docs page views#sync-both-ways-caldav". Admin text only: control and invisible characters are removed, everything is on one line, and the log's scrubber masks e-mail addresses, phone numbers, addresses and tokens. They go into the summary's user turn as the delimited `<handled_topics>` data block (title, status, note – never who set them; `<` `>` become `‹` `›`). The fixed system prompt tells the model to keep questions about them out of `unanswered` and `ideas` and to report a handled topic only in `stillOpen` – when questions of the period still ask about it without an answer, with their count. The maintainer prompt lists `stillOpen` ("Already handled, but still asked without an answer") and every handled topic ("Already handled topics – report one only if it is still unanswered, with the count; don't propose it again otherwise").
 - **Retention**: the summaries quote questions, so their content follows the log – it is cleared after `logging.retentionDays` and all of it when logging is turned off; the rows (cost, counts) stay for the budget and the statistics (400 days).
 - **Cost** (Haiku 5.5 at $0.10 / $0.50 per million tokens): a typical daily summary of ~100–500 short questions is about 3,000–20,000 input and 1,000–2,000 output tokens, **≈ $0.001–0.003** (a month of daily summaries ≈ $0.05); the reserved worst case of a full 500-question prompt is about $0.01. With Sonnet 5.5 about 20×, with Opus 5.5 about 40× that.
 
@@ -244,7 +253,7 @@ For flowplan-admin (server to server): every request needs `Authorization: Beare
 
 Newest first, `limit` 1–500 (default 100). With logging off: `{ "enabled": false, "entries": [] }`. Entries are anonymised: no subject, no session, no Discord or IP data; e-mail addresses, phone numbers, IP addresses and long tokens in the text are masked.
 
-### `GET · POST /api/admin/insights`
+### `GET · POST /api/admin/insights` · `POST /api/admin/insight-handled`
 
 The [insight summaries](#insights).
 
@@ -256,20 +265,37 @@ The [insight summaries](#insights).
     "interval": "daily", "model": "claude-haiku-5-5", "retentionDays": 30, "maxQuestions": 500,
     "running": false,              // a summary is being generated
     "nextRunAt": "2026-11-23T00:00:00.000Z", // null when off or the log is off
+    "manualWindow": { "from": "2026-11-21T00:00:00.000Z", "to": "…", "label": "2026-11-21 – 2026-11-23",
+                      "basis": "handled", "handledId": 11, "maxDays": 30 }, // what "Generate now" would summarise now
     "entries": [{ "id": 12, "createdAt": "…", "kind": "scheduled", "interval": "daily", "period": "2026-11-21",
                   "label": "2026-11-21", "from": "…", "to": "…",
                   "status": "ok",          // pending | ok | empty (no questions, no call) | error
                   "error": null,           // upstream | invalid_answer | max_tokens | refusal | interrupted
                   "model": "claude-haiku-5-5", "questions": 132, "sent": 132, "unanswered": 9, "refused": 2,
                   "costUsd": 0.0021, "inputTokens": 14200, "outputTokens": 1300, "latencyMs": 9800,
+                  "basis": "period",       // period (scheduled) | default (last 24 h / 7 days) | handled (since a handled mark) | capped (30 days)
+                  "handled": false, "handledAt": null, "handledBy": null, // marked as handled, when and by whom (the admin's actor)
                   "topTopics": ["Database views", "Self-hosting", "Formulas"], "ideas": 3 }]
   }
   ```
   `kind` is `scheduled` or `manual`; `period` is `YYYY-MM-DD` or `YYYY-Www` (ISO week) for scheduled ones, null for manual ones; `label` is the period as shown (a date or `from – to`).
-- `GET /api/admin/insights?id=12` → `{ "entry": { …the fields above without topTopics/ideas…, "result": { "topics": [{ "title", "count" }], "unanswered": [{ "question", "count", "note" }], "ideas": [{ "kind": "docs" | "feature", "title", "detail" }] } | null, "prompt": "Here are the open questions from Flo users …" | null } }`; 404 `not_found` (also once its content is purged), 400 `invalid_id`.
+- `GET /api/admin/insights?id=12` → `{ "entry": { …the fields above without topTopics/ideas…, "result": { "topics": [{ "title", "count" }], "unanswered": [{ "question", "count", "note" }], "ideas": [{ "kind": "docs" | "feature", "title", "detail" }], "stillOpen": [{ "topic", "count", "note" }] } | null, "prompt": "Here are the open questions from Flo users …" | null } }`; 404 `not_found` (also once its content is purged), 400 `invalid_id`.
 - `POST /api/admin/insights` `{ "actor": "yannic" }` – **Generate now**, synchronous (up to about a minute) → `{ "entry": { … as with ?id= } }` (status `ok`, `empty` or `error`). Errors: 409 `log_off` (the Q&A log is off), 409 `busy` (one is running), 503 `off` (no API key), 429 `{ error: "limit", scope: "budget" | "global" }`, 502 `upstream`.
 
+- `POST /api/admin/insight-handled` `{ "id": 12, "handled": true, "actor": "yannic" }` – mark a summary as handled (or `false`: take the mark away) → `{ "entry": { … as with ?id= } }`. Errors: 400 `invalid_id`, `invalid_handled`; 404 `not_found` (also while the log is off or once its content is purged); 409 `not_handleable` (only `ok` and `empty` summaries).
+
 The interval and the model are part of the settings (`insights`).
+
+### `GET · POST · PUT · DELETE /api/admin/handled-topics`
+
+The [handled topics](#handled-marks-and-handled-topics), oldest first.
+
+- `GET` → `{ "topics": [{ "id": 3, "title": "CalDAV", "status": "done", "note": "Docs page views#sync-both-ways-caldav", "createdAt": "…", "updatedAt": "…", "actor": "yannic" }], "max": 100 }` (`status`: `done` | `not_a_topic`).
+- `POST` `{ "title", "status", "note"?, "actor" }` → `{ "topic": { … }, "topics": [ … ] }`.
+- `PUT` `{ "id", "title"?, "status"?, "note"?, "actor" }` – fields left out keep their value → `{ "topic", "topics" }`.
+- `DELETE ?id=3` (or `{ "id" }`) → `{ "topics": [ … ] }`.
+
+Errors: 400 `invalid_topic` (title empty or longer than 80 characters, note longer than 200, unknown status) or `invalid_id`; 404 `not_found`; 409 `exists` (the same title, ignoring case) or `too_many` (100).
 
 ### `GET /api/admin/export?format=csv&from=&to=`
 
@@ -278,7 +304,7 @@ The daily usage (fields as in `/usage`) as a CSV download: header line, RFC 4180
 ## Security and privacy
 
 - **Secrets only from the environment**: `ANTHROPIC_API_KEY` is read by the SDK (`new Anthropic()`), never logged, never returned; failed API calls are logged only as status, error type and request id – never the message or headers. `ASK_ADMIN_TOKEN` and `ASK_BOT_TOKEN` must be at least 24 characters, are compared in constant time and must differ. `ASK_SECRET` (or a key generated once into the data directory, mode 600) signs session tokens and challenges and keys every HMAC.
-- **Nothing personal goes to Anthropic**: only the question, the bounded conversation and doc excerpts. No names, Discord ids, channel or role ids, IP addresses, session tokens or subjects; no `metadata.user_id`. The insight summary gets only the scrubbed question texts of the anonymised log and whether each was answered.
+- **Nothing personal goes to Anthropic**: only the question, the bounded conversation and doc excerpts. No names, Discord ids, channel or role ids, IP addresses, session tokens or subjects; no `metadata.user_id`. The insight summary gets only the scrubbed question texts of the anonymised log, whether each was answered, and the maintainer's handled topics (title, status, note – admin text, scrubbed; never who set them).
 - **Prompt injection**: question, conversation and docs are delimited data; the system prompt forbids following instructions in them, revealing itself, role play and non-Flowplan topics; and whatever the model returns passes the sanitiser and the prompt-leak check. The model has no tools, so an injection can at most change the text of one answer.
 - **Abuse**: proof-of-work sessions, per-subject, per-address, global and budget limits, the block list, body size and length limits, 2-hour sessions. The SDK retries a failed call at most once (45 s timeout); a request that died with the process keeps its reserved cost.
 - **No IP addresses stored**: addresses are used only through `ipKey()`, a daily rotating HMAC. Subjects are HMACs and are emptied from the ledger after 40 days (the counts stay for the statistics, 400 days).

@@ -145,6 +145,30 @@ const MIGRATIONS: string[] = [
    CREATE INDEX insights_month ON insights(month);
    CREATE INDEX insights_day ON insights(day);
    CREATE INDEX insights_pending ON insights(status) WHERE status = 'pending';`,
+  // 3: what the maintainer already handled, so the insights stop repeating
+  // it. handled_at/handled_by mark a summary as worked through ("Generate
+  // now" then starts at the newest marked summary's end, at most 30 days
+  // back); basis says where a manual summary's window began ('' = the
+  // last 24 hours or 7 days, 'handled' = at a handled summary, 'capped' =
+  // that mark was older than 30 days). handled_topics are topics the
+  // maintainer dealt with ('done') or decided not to cover ('not_a_topic'),
+  // with a note – admin text only; they go into the summary's user turn as
+  // data. handled_by and actor are the admin's identifier as flowplan-admin
+  // sends it (never sent to Anthropic).
+  `ALTER TABLE insights ADD COLUMN handled_at INTEGER;
+   ALTER TABLE insights ADD COLUMN handled_by TEXT NOT NULL DEFAULT '';
+   ALTER TABLE insights ADD COLUMN basis TEXT NOT NULL DEFAULT '';
+   CREATE INDEX insights_handled ON insights(to_at) WHERE handled_at IS NOT NULL;
+   CREATE TABLE handled_topics (
+     id INTEGER PRIMARY KEY,
+     title TEXT NOT NULL,
+     status TEXT NOT NULL CHECK (status IN ('done','not_a_topic')),
+     note TEXT NOT NULL DEFAULT '',
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     actor TEXT NOT NULL DEFAULT ''
+   );
+   CREATE UNIQUE INDEX handled_topics_title ON handled_topics(lower(title));`,
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 

@@ -15,7 +15,8 @@ import { DAY, dayKey, monthKey, now } from "./clock";
 import { block, listBlocked, unblock } from "./subjects";
 import { topics } from "./topics";
 import { purgeLog, readLog } from "./qalog";
-import { listInsights, purgeInsights, readInsight, runInsights } from "./insights";
+import { listInsights, markInsightHandled, purgeInsights, readInsight, runInsights } from "./insights";
+import { MAX_HANDLED_TOPICS, addHandledTopic, editHandledTopic, listHandledTopics, removeHandledTopic } from "./handled-topics";
 import { insightsNano } from "./limits";
 import type { Source } from "./limits";
 
@@ -206,6 +207,19 @@ export async function adminRoute(request: Request, name: string) {
       const r = await runInsights({ kind: "manual", actor });
       if (!("id" in r)) throw new HttpError(409, "busy", "A summary is being generated right now.");
       return json({ entry: readInsight(r.id) });
+    }
+    case "insight-handled": {
+      // Mark a summary as worked through: "Generate now" starts at its end.
+      only("POST");
+      return json({ entry: markInsightHandled(await readJson(request, 4096)) });
+    }
+    case "handled-topics": {
+      only("GET", "POST", "PUT", "DELETE");
+      if (method === "GET") return json({ topics: listHandledTopics(), max: MAX_HANDLED_TOPICS });
+      if (method === "POST") return json(addHandledTopic(await readJson(request, 4096)));
+      if (method === "PUT") return json(editHandledTopic(await readJson(request, 4096)));
+      const body = (request.headers.get("content-type") || "").includes("json") ? await readJson(request, 4096, true) : {};
+      return json(removeHandledTopic(params.get("id") ?? body.id));
     }
     case "export": {
       only("GET");

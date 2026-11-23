@@ -19,7 +19,11 @@
 // ISO week from Monday) once – the period is unique in the table, a pending
 // run blocks every other one (also across processes), and a failed period
 // is retried at most three times. "Generate now" (POST
-// /api/admin/insights) summarises the last 24 hours or 7 days.
+// /api/admin/insights) summarises the questions since the end of the newest
+// summary marked as handled (POST /api/admin/insight-handled), at most
+// MAX_MANUAL_DAYS back; without any mark the last 24 hours or 7 days.
+// The handled topics (lib/handled-topics.ts) go in as data, so the summary
+// reports them only while they are still asked without an answer.
 import Anthropic from "@anthropic-ai/sdk";
 import { all, one, run } from "./db";
 import { DAY, dayKey, now, startOfDay } from "./clock";
@@ -30,7 +34,8 @@ import { insightReservedNano, reserveInsight, settleInsight } from "./limits";
 import { LimitError } from "./rate-limit";
 import { ceilingNano, costNano, usd } from "./models";
 import { describeError, summarizeClaude } from "./claude";
-import { insightsPromptBytes, insightsUserTurn, type InsightQuestion } from "./prompt-insights";
+import { insightsPromptBytes, insightsUserTurn, type InsightHandledTopic, type InsightQuestion } from "./prompt-insights";
+import { listHandledTopics } from "./handled-topics";
 import { scrub } from "./qalog";
 import { sanitizeInsightText } from "./sanitize";
 
@@ -42,6 +47,8 @@ export const INSIGHTS_MAX_TOKENS = 4000;
 export const INSIGHT_RETRIES = 3;
 // How often the timer looks whether a period is due.
 export const INSIGHTS_TICK_MS = 10 * 60_000;
+// "Generate now" after a handled mark reaches back at most this far.
+export const MAX_MANUAL_DAYS = 30;
 
 // ---- whether Flo could answer ----------------------------------------------
 // The log has no "answered" flag, so it is derived cheaply from what is
@@ -60,7 +67,11 @@ export function answeredOf(row: { outcome: string; hasSources: boolean; answer: 
 }
 
 // ---- periods ----------------------------------------------------------------
-export type InsightWindow = { interval: "daily" | "weekly"; period: string | null; label: string; fromAt: number; toAt: number };
+// basis: where a manual window begins – "default" (the last 24 hours or 7
+// days), "handled" (at the end of the newest summary marked as handled),
+// "capped" (that mark is older than MAX_MANUAL_DAYS); "period" for a scheduled one.
+export type WindowBasis = "period" | "default" | "handled" | "capped";
+export type InsightWindow = { interval: "daily" | "weekly"; period: string | null; label: string; fromAt: number; toAt: number; basis: WindowBasis };
 
 export function isoWeek(at: number) {
   const day = startOfDay(at);
@@ -75,18 +86,33 @@ const mondayOf = (at: number) => startOfDay(at) - ((new Date(startOfDay(at)).get
 export function scheduledWindow(interval: "daily" | "weekly", at: number): InsightWindow {
   if (interval === "daily") {
     const from = startOfDay(at) - DAY;
-    return { interval, period: dayKey(from), label: dayKey(from), fromAt: from, toAt: from + DAY };
+    return { interval, period: dayKey(from), label: dayKey(from), fromAt: from, toAt: from + DAY, basis: "period" };
   }
   const monday = mondayOf(at);
   const from = monday - 7 * DAY;
-  return { interval, period: isoWeek(from), label: `${dayKey(from)} – ${dayKey(monday - DAY)}`, fromAt: from, toAt: monday };
+  return { interval, period: isoWeek(from), label: `${dayKey(from)} – ${dayKey(monday - DAY)}`, fromAt: from, toAt: monday, basis: "period" };
 }
-// "Generate now": the last 24 hours (daily) or the last 7 days (weekly, or when the schedule is off).
-export function manualWindow(interval: InsightsInterval, at: number): InsightWindow {
+// "Generate now": the questions since `handledTo` (the end of the newest
+// summary marked as handled), at most MAX_MANUAL_DAYS back; without a mark
+// the last 24 hours (daily) or the last 7 days (weekly, or when the schedule is off).
+export function manualWindow(interval: InsightsInterval, at: number, handledTo: number | null = null): InsightWindow {
   const daily = interval === "daily";
-  const fromAt = at - (daily ? 1 : 7) * DAY;
-  return { interval: daily ? "daily" : "weekly", period: null, label: `${dayKey(fromAt)} – ${dayKey(at)}`, fromAt, toAt: at + 1 };
+  const base = { interval: daily ? ("daily" as const) : ("weekly" as const), period: null, toAt: at + 1 };
+  let fromAt = at - (daily ? 1 : 7) * DAY;
+  let basis: WindowBasis = "default";
+  if (handledTo !== null) {
+    const earliest = at - MAX_MANUAL_DAYS * DAY;
+    basis = handledTo < earliest ? "capped" : "handled";
+    fromAt = Math.min(at, Math.max(earliest, handledTo));
+  }
+  return { ...base, label: `${dayKey(fromAt)} – ${dayKey(at)}`, fromAt, basis };
 }
+// The newest handled mark: the end of the summary marked as handled that reaches furthest.
+export function handledMark() {
+  return one<{ id: number; to_at: number }>("SELECT id, to_at FROM insights WHERE handled_at IS NOT NULL ORDER BY to_at DESC, id DESC LIMIT 1") ?? null;
+}
+// The handled topics as they go into the summary: title, status, note – never who set them.
+export const handledForPrompt = (): InsightHandledTopic[] => listHandledTopics().map((t) => ({ title: t.title, status: t.status, note: t.note }));
 // When the next scheduled summary starts (null when off or the log is off).
 export function nextRunAt(settings: Settings, at = now()) {
   const interval = settings.insights.interval;
@@ -142,8 +168,10 @@ export type InsightResult = {
   topics: { title: string; count: number }[];
   unanswered: { question: string; count: number; note: string }[];
   ideas: { kind: "docs" | "feature"; title: string; detail: string }[];
+  // Handled topics still asked without an answer (missing in summaries made before it existed).
+  stillOpen?: { topic: string; count: number; note: string }[];
 };
-const LIMITS = { topics: 12, unanswered: 25, ideas: 12 };
+const LIMITS = { topics: 12, unanswered: 25, ideas: 12, stillOpen: 12 };
 
 // The model's answer → a clean result, or null when it is no usable JSON
 // object. Every string passes the answer sanitiser (no HTML, links only to
@@ -180,14 +208,38 @@ export function parseInsights(text: string, maxCount: number): InsightResult | n
     ideas: list(o.ideas, LIMITS.ideas)
       .map((e) => ({ kind: e.kind === "feature" ? ("feature" as const) : ("docs" as const), title: txt(e.title, 120), detail: txt(e.detail, 400) }))
       .filter((e) => e.title),
+    stillOpen: list(o.stillOpen, LIMITS.stillOpen)
+      .map((e) => ({ topic: txt(e.topic, 80), count: Math.max(1, count(e.count)), note: txt(e.note, 300) }))
+      .filter((e) => e.topic),
   };
 }
 
 // ---- the prompt for the maintainer ------------------------------------------------
-type PromptInput = { interval: "daily" | "weekly"; kind: "scheduled" | "manual"; label: string; questions: number; unanswered: number; result: InsightResult };
+type PromptInput = {
+  interval: "daily" | "weekly";
+  kind: "scheduled" | "manual";
+  label: string;
+  questions: number;
+  unanswered: number;
+  result: InsightResult;
+  basis?: WindowBasis;
+  handled?: InsightHandledTopic[];
+};
 export function maintainerPrompt(e: PromptInput) {
   const when =
-    e.kind === "manual" ? (e.interval === "daily" ? "in the last 24 hours" : "in the last 7 days") : e.interval === "daily" ? `on ${e.label}` : `this week (${e.label})`;
+    e.kind === "manual"
+      ? e.basis === "handled"
+        ? `between ${e.label} (since the last summary marked as handled)`
+        : e.basis === "capped"
+          ? `in the last ${MAX_MANUAL_DAYS} days (${e.label}; the last summary marked as handled is older)`
+          : e.interval === "daily"
+            ? "in the last 24 hours"
+            : "in the last 7 days"
+      : e.interval === "daily"
+        ? `on ${e.label}`
+        : `this week (${e.label})`;
+  const handled = e.handled ?? [];
+  const stillOpen = e.result.stillOpen ?? [];
   const lines = [
     `Here are the open questions from Flo users ${when} (Flo is the docs assistant of Flowplan; it answers only from docs.flowplan.org). ${e.questions} questions were asked, ${e.unanswered} of them Flo could not answer from the docs.`,
     "",
@@ -203,9 +255,17 @@ export function maintainerPrompt(e: PromptInput) {
     lines.push("", "Candidate docs pages and features (suggested by the summary, unchecked):");
     for (const i of e.result.ideas) lines.push(`- [${i.kind}] ${i.title}${i.detail ? ` – ${i.detail}` : ""}`);
   }
+  if (stillOpen.length) {
+    lines.push("", "Already handled, but still asked without an answer:");
+    for (const o of stillOpen) lines.push(`- ${o.topic} (×${o.count})${o.note ? ` – ${o.note}` : ""}`);
+  }
+  if (handled.length) {
+    lines.push("", "Already handled topics – report one only if it is still unanswered, with the count; don't propose it again otherwise:");
+    for (const t of handled) lines.push(`- ${t.title} [${t.status === "done" ? "done" : "not a topic"}]${t.note ? ` – ${t.note}` : ""}`);
+  }
   lines.push(
     "",
-    "Please check the docs (flowplan-docs) and Flowplan itself for these gaps: for each open question, find out whether the docs really miss it (or only word it so it isn't found), whether a feature is missing, or whether it is out of scope. Then propose GitHub issues – one per gap, with a title, a short description, whether it is a docs or a feature issue, and which questions it answers – and leave out what an existing issue already covers. Don't change anything yet; list your findings and the proposed issues first.",
+    `Please check the docs (flowplan-docs) and Flowplan itself for these gaps: for each open question, find out whether the docs really miss it (or only word it so it isn't found), whether a feature is missing, or whether it is out of scope. Then propose GitHub issues – one per gap, with a title, a short description, whether it is a docs or a feature issue, and which questions it answers – and leave out what an existing issue${handled.length ? " or an already handled topic" : ""} already covers. Don't change anything yet; list your findings and the proposed issues first.`,
   );
   return lines.join("\n");
 }
@@ -230,7 +290,9 @@ export async function runInsights(opts: { kind: "scheduled" | "manual"; actor?: 
   if (!manual && settings.insights.interval === "off") return { skipped: "off" };
   if (!config.anthropicConfigured()) return skip(503, "off", "No ANTHROPIC_API_KEY is configured.");
   if (holder.askInsightsRunning) return skip(409, "busy", "A summary is being generated right now.");
-  const w = manual ? manualWindow(settings.insights.interval, at) : scheduledWindow(settings.insights.interval as "daily" | "weekly", at);
+  const w = manual
+    ? manualWindow(settings.insights.interval, at, handledMark()?.to_at ?? null)
+    : scheduledWindow(settings.insights.interval as "daily" | "weekly", at);
   if (w.period && (one("SELECT id FROM insights WHERE period=?", w.period) || failures(w.period) >= INSIGHT_RETRIES)) return { skipped: "done" };
 
   holder.askInsightsRunning = true;
@@ -249,10 +311,11 @@ export async function runInsights(opts: { kind: "scheduled" | "manual"; actor?: 
       actor: opts.actor,
       at,
     };
-    const user = data.questions.length ? insightsUserTurn({ period: w.label, total: data.total, questions: data.questions }) : "";
+    const user = data.questions.length ? insightsUserTurn({ period: w.label, total: data.total, questions: data.questions, handled: handledForPrompt() }) : "";
     // Nothing asked: an 'empty' summary, no call, nothing spent.
     const reserved = reserveInsight({ ...base, ceilingNano: user ? ceilingNano(model, insightsPromptBytes(user), INSIGHTS_MAX_TOKENS) : 0 });
     if ("skipped" in reserved) return reserved.skipped === "busy" ? skip(409, "busy", "A summary is being generated right now.") : { skipped: reserved.skipped };
+    if (manual && w.basis !== "default") run("UPDATE insights SET basis=? WHERE id=?", w.basis, reserved.id);
     if (!user) return reserved;
 
     const started = performance.now();
@@ -322,7 +385,11 @@ type Row = {
   input_tokens: number;
   output_tokens: number;
   latency_ms: number | null;
+  handled_at: number | null;
+  handled_by: string;
+  basis: string;
 };
+const basisOf = (r: Row): WindowBasis => (r.kind === "scheduled" ? "period" : r.basis === "handled" || r.basis === "capped" ? r.basis : "default");
 const iso = (ms: number) => new Date(ms).toISOString();
 function resultOf(r: Row): InsightResult | null {
   if (r.status !== "ok" || !r.result) return null;
@@ -357,6 +424,10 @@ function head(r: Row) {
     inputTokens: r.input_tokens,
     outputTokens: r.output_tokens,
     latencyMs: r.latency_ms,
+    basis: basisOf(r),
+    handled: r.handled_at !== null,
+    handledAt: r.handled_at === null ? null : iso(r.handled_at),
+    handledBy: r.handled_at === null ? null : r.handled_by || null,
   };
 }
 
@@ -366,6 +437,8 @@ export function listInsights(params: URLSearchParams, at = now()) {
   const l = params.get("limit");
   const max = l && /^\d{1,3}$/.test(l) ? Math.min(100, Math.max(1, Number(l))) : 30;
   const rows = settings.logging.enabled ? all<Row>("SELECT * FROM insights WHERE purged=0 ORDER BY created_at DESC, id DESC LIMIT ?", max) : [];
+  const mark = handledMark();
+  const next = manualWindow(settings.insights.interval, at, mark?.to_at ?? null);
   return {
     enabled: settings.logging.enabled,
     interval: settings.insights.interval,
@@ -374,6 +447,8 @@ export function listInsights(params: URLSearchParams, at = now()) {
     maxQuestions: MAX_INSIGHT_QUESTIONS,
     running: insightsRunning(),
     nextRunAt: nextRunAt(settings, at) === null ? null : iso(nextRunAt(settings, at)!),
+    // What "Generate now" would summarise right now.
+    manualWindow: { from: iso(next.fromAt), to: iso(at), label: next.label, basis: next.basis, handledId: mark?.id ?? null, maxDays: MAX_MANUAL_DAYS },
     entries: rows.map((r) => {
       const result = resultOf(r);
       return {
@@ -393,8 +468,27 @@ export function readInsight(id: number) {
   return {
     ...head(r),
     result,
-    prompt: result ? maintainerPrompt({ interval: r.interval, kind: r.kind, label: labelOf(r), questions: r.questions, unanswered: r.unanswered, result }) : null,
+    prompt: result
+      ? maintainerPrompt({ interval: r.interval, kind: r.kind, label: labelOf(r), questions: r.questions, unanswered: r.unanswered, result, basis: basisOf(r), handled: handledForPrompt() })
+      : null,
   };
+}
+
+// POST /api/admin/insight-handled {id, handled, actor}: marks a summary as
+// worked through (or takes the mark away). Only a finished one (ok or empty)
+// can be marked; "Generate now" then starts where the newest marked one ended.
+export function markInsightHandled(body: Record<string, unknown>, at = now()) {
+  const raw = body.id;
+  const id = typeof raw === "number" ? raw : typeof raw === "string" && /^\d{1,12}$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isSafeInteger(id) || id < 1) throw new HttpError(400, "invalid_id", "id must be a number.");
+  if (typeof body.handled !== "boolean") throw new HttpError(400, "invalid_handled", "handled must be true or false.");
+  const r = getSettings().logging.enabled ? one<Row>("SELECT * FROM insights WHERE id=? AND purged=0", id) : undefined;
+  if (!r) throw new HttpError(404, "not_found", "No such summary.");
+  if (r.status !== "ok" && r.status !== "empty") throw new HttpError(409, "not_handleable", "Only a finished summary can be marked as handled.");
+  const actor = typeof body.actor === "string" ? body.actor.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 100) : "";
+  if (body.handled) run("UPDATE insights SET handled_at=?, handled_by=? WHERE id=?", at, actor, id);
+  else run("UPDATE insights SET handled_at=NULL, handled_by='' WHERE id=?", id);
+  return readInsight(id);
 }
 
 // The summaries' content follows the log (they quote its questions): cleared

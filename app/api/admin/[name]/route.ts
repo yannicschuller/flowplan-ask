@@ -1,7 +1,7 @@
 import { handle } from "@/lib/http";
 import { adminRoute } from "@/lib/routes";
 
-// /api/admin/settings | summary | usage | topics | blocklist | log | insights | export (README "Admin API").
+// /api/admin/settings | summary | usage | topics | blocklist | log | insights | insight-handled | handled-topics | export (README "Admin API").
 export const dynamic = "force-dynamic";
 type Ctx = { params: Promise<{ name: string }> };
 const route = async (request: Request, ctx: Ctx) => {
