@@ -121,9 +121,9 @@ test("who may ask: a valid session from an allowed origin, JSON within the size 
 });
 
 test("input limits: question length, history turns and characters", async () => {
-  const long = await askDocs({ question: "x".repeat(501) });
+  const long = await askDocs({ question: "x".repeat(2001) });
   assert.equal(long.status, 400);
-  assert.deepEqual({ ...(await body(long)), message: undefined }, { error: "too_long", max: 500, message: undefined });
+  assert.deepEqual({ ...(await body(long)), message: undefined }, { error: "too_long", max: 2000, message: undefined });
   assert.equal((await body(await askDocs({ question: "   " }))).error, "invalid_question");
   assert.equal((await body(await askDocs({ question: 42 }))).error, "invalid_question");
   assert.equal((await body(await askDocs({ question: "x?", history: [{ role: "system", text: "x" }] }))).error, "invalid_history");
@@ -140,7 +140,7 @@ test("input limits: question length, history turns and characters", async () => 
   assert.match(text, /old answer 7/);
   assert.equal(text.match(/<turn /g)!.length, 6);
   // At most maxConversationChars: the oldest go first.
-  settings({ maxConversationChars: 500 });
+  settings({ maxQuestionChars: 500, maxConversationChars: 500 });
   await askDocs({ question: "And passkeys?", history: [{ role: "user", text: "a".repeat(300) }, { role: "assistant", text: "b".repeat(300) }] });
   assert.doesNotMatch(userText(last().body), /aaaa/);
   assert.match(userText(last().body), /bbbb/);

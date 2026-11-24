@@ -32,7 +32,7 @@ export const DEFAULT_SETTINGS: Settings = {
   enabled: { global: true, docs: true, discord: true },
   model: DEFAULT_MODEL,
   maxTokens: 1000,
-  maxQuestionChars: 500,
+  maxQuestionChars: 2000,
   maxTurns: 6,
   maxConversationChars: 4000,
   limits: {
