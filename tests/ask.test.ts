@@ -49,7 +49,7 @@ test("a docs question: one Messages call with a cached system prompt, the docs a
   const { body: sent, headers, path } = last();
   assert.equal(path, "/v1/messages");
   assert.equal(sent.model, "claude-haiku-5-5");
-  assert.equal(sent.max_tokens, 700);
+  assert.equal(sent.max_tokens, 1000);
   assert.deepEqual(sent.output_config, { effort: "low" });
   assert.deepEqual(sent.system, [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }]);
   for (const key of ["tools", "tool_choice", "mcp_servers", "metadata", "stream", "temperature", "thinking", "container"]) assert.equal(key in sent, false, key);

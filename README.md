@@ -191,7 +191,7 @@ For flowplan-admin (server to server): every request needs `Authorization: Beare
 {
   "enabled": { "global": true, "docs": true, "discord": true },
   "model": "claude-haiku-5-5",            // claude-haiku-5-5 | claude-sonnet-5-5 | claude-opus-5-5
-  "maxTokens": 700,                       // 100–4000
+  "maxTokens": 1000,                      // 100–4000
   "maxQuestionChars": 500,                // 50–4000
   "maxTurns": 6,                          // 0–20 history entries (question or answer each)
   "maxConversationChars": 4000,           // 500–50000, ≥ maxQuestionChars

@@ -31,7 +31,7 @@ export const INSIGHTS_INTERVALS: InsightsInterval[] = ["off", "daily", "weekly"]
 export const DEFAULT_SETTINGS: Settings = {
   enabled: { global: true, docs: true, discord: true },
   model: DEFAULT_MODEL,
-  maxTokens: 700,
+  maxTokens: 1000,
   maxQuestionChars: 500,
   maxTurns: 6,
   maxConversationChars: 4000,
