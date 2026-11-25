@@ -41,7 +41,8 @@ test("a docs question: one Messages call with a cached system prompt, the docs a
   assert.equal(r.status, 200);
   assert.equal(r.headers.get("access-control-allow-origin"), DOCS_ORIGIN);
   const a = await body(r);
-  assert.match(a.answer, /Sources:\n- \[First steps – Sign in or sign up\]\(http:\/\/127\.0\.0\.1:\d+\/en\/first-steps#sign-in-or-sign-up\)/);
+  // The sources line (system prompt rule 10) becomes `sources`; the answer keeps no sources heading.
+  assert.equal(a.answer, "Here is how it works: see the docs.");
   assert.deepEqual(a.sources, [{ title: "First steps – Sign in or sign up", url: `${docs.base}/en/first-steps#sign-in-or-sign-up` }]);
   assert.equal(a.usage.remainingToday, 99);
 

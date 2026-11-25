@@ -5,11 +5,13 @@ import { allowedLink, linksIn, MAX_ANSWER_CHARS, sanitizeAnswer } from "../lib/s
 process.env.DOCS_URL = "https://docs.flowplan.org";
 const clean = (s: string, locale: "de" | "en" = "en") => sanitizeAnswer(s, locale);
 
-test("the link allow-list is exactly the docs, the website, Flowplan's GitHub repositories and the Discord invite", () => {
+test("the link allow-list is exactly the docs, the website, the status page, Flowplan's GitHub repositories and the Discord invite", () => {
   const ok = [
     "https://docs.flowplan.org/en/backup#automatic-backups",
     "https://flowplan.org/de/download",
     "https://flowplan.org",
+    "https://status.flowplan.org",
+    "https://status.flowplan.org/",
     "https://github.com/yannicschuller/flowplan/issues",
     "https://github.com/yannicschuller/flowplan-docs",
     "https://discord.gg/bCEdB6MPrR",
@@ -20,6 +22,9 @@ test("the link allow-list is exactly the docs, the website, Flowplan's GitHub re
     "https://docs.flowplan.org.evil.com/x",
     "https://evil.com/?https://docs.flowplan.org",
     "https://app.flowplan.org/",
+    "http://status.flowplan.org",
+    "https://status.flowplan.org.evil.com/",
+    "https://status.flowplan.org:444/",
     "https://github.com/yannicschuller/other",
     "https://github.com/evil/flowplan",
     "https://github.com/yannicschuller",

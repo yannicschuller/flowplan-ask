@@ -6,7 +6,7 @@ import { one, run } from "./db";
 import { HttpError } from "./http";
 import { DEFAULT_MODEL, MODELS, isModel, type ModelId } from "./models";
 import { now } from "./clock";
-import { config } from "./config";
+import { config, fetchableUrl } from "./config";
 
 export type SubjectLimits = { perMinute: number; perHour: number; perDay: number; perMonth: number; costPerDayUsd: number; costPerMonthUsd: number };
 export type GlobalLimits = { perDay: number; perMonth: number; costPerDayUsd: number; costPerMonthUsd: number };
@@ -27,6 +27,10 @@ export type Settings = {
   // Report drafts for Discord (lib/draft.ts): whether Flo offers them, the
   // draft call's max_tokens and how many drafts one person may have per day.
   reports: { enabled: boolean; maxTokens: number; perDay: number };
+  // The status of Flowplan's hosted services as a data block in the prompt
+  // (lib/hosted-status.ts): on/off and the two addresses ("" = the default,
+  // STATUS_SUMMARY_URL / STATUS_SERVICES_URL or status.flowplan.org's).
+  status: { enabled: boolean; summaryUrl: string; servicesUrl: string };
 };
 export type InsightsInterval = "off" | "daily" | "weekly";
 export const INSIGHTS_INTERVALS: InsightsInterval[] = ["off", "daily", "weekly"];
@@ -48,6 +52,7 @@ export const DEFAULT_SETTINGS: Settings = {
   logging: { enabled: false, retentionDays: 30 },
   insights: { interval: "daily", model: DEFAULT_MODEL },
   reports: { enabled: true, maxTokens: 1500, perDay: 5 },
+  status: { enabled: true, summaryUrl: "", servicesUrl: "" },
 };
 
 // Ranges (the same as flowplan-admin's form). Every count and cost limit
@@ -88,7 +93,9 @@ const CHECKS: [string, string][] = [
   ["limits.global.perDay", "limits.global.perMonth"],
   ["limits.global.costPerDayUsd", "limits.global.costPerMonthUsd"],
 ];
-const BOOLEANS = ["enabled.global", "enabled.docs", "enabled.discord", "logging.enabled", "reports.enabled"];
+const BOOLEANS = ["enabled.global", "enabled.docs", "enabled.discord", "logging.enabled", "reports.enabled", "status.enabled"];
+// Addresses: "" (the default) or https (http only on localhost), at most 500 characters.
+const URLS = ["status.summaryUrl", "status.servicesUrl"];
 const ID_LISTS = ["discord.channelIds", "discord.roleIds"];
 const MAX_IDS = 50;
 
@@ -125,6 +132,13 @@ export function mergeSettings(base: Settings, input: unknown): Settings {
     if (!Array.isArray(v) || v.length > MAX_IDS || !v.every((id) => typeof id === "string" && /^\d{17,20}$/.test(id)))
       errors.push(`${path}: at most ${MAX_IDS} Discord ids (17–20 digits)`);
     else set(out, path, [...new Set(v as string[])]);
+  }
+  for (const path of URLS) {
+    const v = get(input, path);
+    if (v === undefined) continue;
+    const value = typeof v === "string" ? v.trim() : null;
+    if (value === null || value.length > 500 || (value !== "" && !fetchableUrl(value))) errors.push(`${path}: "" or an https URL`);
+    else set(out, path, value === "" ? "" : fetchableUrl(value));
   }
   const model = get(input, "model");
   if (model !== undefined) {

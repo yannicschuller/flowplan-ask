@@ -10,7 +10,8 @@ export const MAX_ANSWER_CHARS = 4000;
 const MAX_INPUT_CHARS = 20_000;
 
 // The links an answer may keep (README "Answers"): the docs, the website,
-// Flowplan's GitHub repositories and the Discord invite – plus the origin
+// the status page of the hosted services, Flowplan's GitHub repositories
+// and the Discord invite – plus the origin
 // of the configured DOCS_URL (the same docs in production).
 export function allowedLink(raw: string, docsOrigin = config.docsOrigin()): string | null {
   if (!/^https?:\/\/\S+$/i.test(raw) || raw.length > 600) return null;
@@ -29,7 +30,7 @@ export function allowedLink(raw: string, docsOrigin = config.docsOrigin()): stri
   if (u.origin === docsOrigin) return href;
   if (u.protocol !== "https:" || u.port) return null;
   const host = u.hostname.toLowerCase();
-  if (host === "docs.flowplan.org" || host === "flowplan.org") return href;
+  if (host === "docs.flowplan.org" || host === "flowplan.org" || host === "status.flowplan.org") return href;
   if (host === "github.com" && /^\/yannicschuller\/flowplan[A-Za-z0-9._-]*(\/|$)/.test(u.pathname)) return href;
   const invite = new URL(DISCORD_INVITE);
   if (host === invite.hostname && u.pathname.replace(/\/+$/, "") === invite.pathname && !u.search && !u.hash) return DISCORD_INVITE;

@@ -1,6 +1,6 @@
 // Every test file gets its own data directory, a known environment, a fake
-// docs site (tests/docs-mock.ts) and a fake Claude API
-// (tests/anthropic-mock.ts) – never the network. The keys and tokens here
+// docs site (tests/docs-mock.ts), fake status data (tests/status-mock.ts)
+// and a fake Claude API (tests/anthropic-mock.ts) – never the network. The keys and tokens here
 // are throwaway values generated at runtime.
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +18,8 @@ import { publicRoute, sessionRoute } from "../lib/routes";
 import { leadingZeroBits, powHash } from "../lib/session";
 import { startAnthropicMock } from "./anthropic-mock";
 import { startDocsMock } from "./docs-mock";
+import { startStatusMock } from "./status-mock";
+import { forgetHostedStatus } from "../lib/hosted-status";
 
 export const BASE = "http://localhost:3000";
 export const DOCS_ORIGIN = "https://docs.flowplan.org";
@@ -29,7 +31,10 @@ export async function setup() {
   const dir = mkdtempSync(join(tmpdir(), "ask-test-"));
   const docs = await startDocsMock();
   const claude = await startAnthropicMock();
+  const status = await startStatusMock();
   process.env.ASK_DATA_DIR = dir;
+  process.env.STATUS_SUMMARY_URL = `${status.base}/summary.json`;
+  process.env.STATUS_SERVICES_URL = `${status.base}/services.json`;
   process.env.ASK_URL = BASE;
   process.env.DOCS_URL = docs.base;
   process.env.ASK_ALLOWED_ORIGINS = DOCS_ORIGIN;
@@ -40,17 +45,20 @@ export async function setup() {
   clock.now = () => Date.now();
   forgetDocs();
   forgetSettings();
+  forgetHostedStatus();
   useAnthropic(new Anthropic({ apiKey: API_KEY, baseURL: claude.base, maxRetries: 0, timeout: 10_000, logLevel: "off" }));
   after(async () => {
     closeDb();
     forgetDocs();
     forgetSettings();
     useAnthropic(null);
+    forgetHostedStatus();
     await docs.close();
+    await status.close();
     await claude.close();
     rmSync(dir, { recursive: true, force: true });
   });
-  return { dir, docs, claude };
+  return { dir, docs, claude, status };
 }
 
 type Init = RequestInit & { json?: unknown; origin?: string | null; session?: string; bot?: string | null; ip?: string };

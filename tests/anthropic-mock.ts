@@ -1,7 +1,7 @@
 // A local stand-in for the Claude Messages API (POST /v1/messages), reached
 // through the SDK's baseURL – never the network. It records every request
 // (headers and body) and answers with `reply(body)`: by default an answer
-// that links the first docs excerpt it was given.
+// that names the first docs excerpt it was given in its sources line.
 import { createServer, type IncomingMessage, type Server } from "node:http";
 
 export type MockRequest = { method: string; path: string; headers: Record<string, string | string[] | undefined>; body: any };
@@ -24,7 +24,7 @@ export const excerptsOf = (body: any) => [...userText(body).matchAll(/<excerpt i
 export function defaultReply(body: any): MockReply {
   const first = excerptsOf(body)[0];
   const text = first
-    ? `Here is how it works: see the docs.\n\nSources:\n- [${first.title}](${first.url})`
+    ? "Here is how it works: see the docs.\n\n[sources: 1]\n[report: none]"
     : "I couldn't find that in the docs.";
   return { text };
 }

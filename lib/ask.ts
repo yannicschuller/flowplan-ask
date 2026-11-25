@@ -1,9 +1,11 @@
 // POST /api/ask (README "Public API"): who is asking (a docs session
 // token or the Discord bot's token), whether Flo is on, the input limits,
 // the Discord allow-list, the block list, the docs excerpts, the limits and
-// the budget (reserved before the call), then the one model call, the
-// sanitised answer (without its report classification line, returned as
-// `report`), the real cost, the statistics and the optional log.
+// the status of the hosted services (fetched by the service, when it may
+// matter), the budget (reserved before the call), then the one model call,
+// the sanitised answer (without its sources and report lines – returned as
+// `sources` and `report` – and without any sources section of its own), the
+// real cost, the statistics and the optional log.
 import Anthropic from "@anthropic-ai/sdk";
 import { config } from "./config";
 import { HttpError, bearer, clientIp, json, readJson } from "./http";
@@ -14,7 +16,8 @@ import { isBlocked, subjectKey, validDiscordSubject } from "./subjects";
 import { getSettings, type Settings } from "./settings";
 import { recordRejection, remainingToday, reserve, reservedNano, settle, type Source } from "./limits";
 import { docsIndex, docsTerms, isLocale, pickSections, type Locale, type Section } from "./docs";
-import { leaksPrompt, promptBytes, splitReport, userTurn, excerptTitle, type Turn } from "./prompt";
+import { leaksPrompt, promptBytes, splitReport, splitSources, stripSourcesTail, userTurn, excerptTitle, type Turn } from "./prompt";
+import { hostedStatus, includeStatus, statusBlock } from "./hosted-status";
 import { ceilingNano, costNano } from "./models";
 import { askClaude, describeError } from "./claude";
 import { linksIn, sanitizeAnswer } from "./sanitize";
@@ -125,10 +128,17 @@ const FALLBACK = {
   },
 };
 
-// The sources: the excerpts the answer links to (by URL, or by page).
-function sourcesOf(answer: string, sections: Section[]) {
+// The sources: the excerpts the sources line names (system prompt rule 10),
+// then the ones the answer links to (by URL, or by page).
+function sourcesOf(answer: string, sections: Section[], indexes: number[] = []) {
   const out: { title: string; url: string }[] = [];
   const seen = new Set<string>();
+  for (const n of indexes) {
+    const s = sections[n - 1];
+    if (!s || seen.has(s.url)) continue;
+    seen.add(s.url);
+    out.push({ title: excerptTitle(s), url: s.url });
+  }
   for (const link of linksIn(answer)) {
     const exact = sections.find((s) => s.url === link);
     const page = exact ?? sections.find((s) => s.url.split("#")[0] === link.split("#")[0]);
@@ -159,17 +169,20 @@ export async function askRoute(request: Request): Promise<Response> {
     throw new LimitError("subject", nextMonth(now()));
   }
 
-  const index = await docsIndex();
+  // The docs and the status of the hosted services in parallel; the status
+  // never fails a question (unreadable → the block says so).
+  const [index, hosted] = await Promise.all([docsIndex(), hostedStatus(settings).catch(() => ({ ok: false }) as const)]);
   if (!index) throw new HttpError(502, "unavailable", "The docs cannot be read right now – please try again in a few minutes.");
   // A follow-up question is searched together with the previous one.
   const lastUser = [...input.history].reverse().find((t) => t.role === "user")?.text ?? "";
   let sections = pickSections(index, `${input.question}\n${lastUser}`, input.locale, input.page);
+  const block = hosted && includeStatus(hosted, `${input.question}\n${lastUser}`) ? statusBlock(hosted) : undefined;
   let history = input.history;
-  let user = userTurn({ sections, history, question: input.question, locale: input.locale });
+  let user = userTurn({ sections, history, question: input.question, locale: input.locale, status: block });
   while (promptBytes(user) > MAX_PROMPT_BYTES && (history.length || sections.length > 1)) {
     if (history.length) history = history.slice(1);
     else sections = sections.slice(0, -1);
-    user = userTurn({ sections, history, question: input.question, locale: input.locale });
+    user = userTurn({ sections, history, question: input.question, locale: input.locale, status: block });
   }
 
   const model = settings.model;
@@ -198,14 +211,20 @@ export async function askRoute(request: Request): Promise<Response> {
   const status = reply.stopReason === "refusal" || leaksPrompt(reply.text) ? "refusal" : reply.stopReason === "max_tokens" ? "max_tokens" : "ok";
   // The classification line (system prompt rule 14) never reaches the reader.
   const split = splitReport(reply.text);
+  // So does the sources line (rule 10): the clients show `sources` themselves.
+  const cited = splitSources(split.text);
   // Only a complete answer may offer a report – and only while reports are on.
   const report = status === "ok" && settings.reports.enabled ? split.report : null;
-  let raw = split.text.trim();
+  let raw = cited.text.trim();
   if (status === "refusal") raw = FALLBACK.refusal[input.locale];
   else if (status === "max_tokens") raw = raw ? `${raw} …\n\n${FALLBACK.cut[input.locale]}` : `${FALLBACK.cut[input.locale]}\n\n${FALLBACK.empty[input.locale]}`;
   else if (!raw) raw = FALLBACK.empty[input.locale];
-  const answer = sanitizeAnswer(raw, input.locale);
-  const sources = status === "refusal" ? [] : sourcesOf(answer, sections);
+  const clean = sanitizeAnswer(raw, input.locale);
+  const sources = status === "refusal" ? [] : sourcesOf(clean, sections, cited.indexes);
+  // A sources section the model wrote anyway goes – its links already
+  // counted above – so a client never shows two headings (one of them,
+  // perhaps, in the wrong language).
+  const answer = stripSourcesTail(clean) || clean;
   const cost = costNano(model, reply.usage);
   settle(id, {
     status,

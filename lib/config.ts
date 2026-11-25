@@ -37,6 +37,25 @@ const origins = (value: string) =>
 export const DEFAULT_DOCS_URL = "https://docs.flowplan.org";
 // The Flowplan Discord invite: the only Discord link an answer may keep.
 export const DISCORD_INVITE = "https://discord.gg/bCEdB6MPrR";
+// The status page of Flowplan's hosted services and its data (README "Status
+// of the hosted services"): summary.json is written every 5 minutes by the
+// flowplan-status GitHub Action, services.json holds the groups and names.
+export const STATUS_PAGE = "https://status.flowplan.org";
+export const DEFAULT_STATUS_SUMMARY_URL = "https://raw.githubusercontent.com/yannicschuller/flowplan-status/status-data/summary.json";
+export const DEFAULT_STATUS_SERVICES_URL = "https://status.flowplan.org/services.json";
+
+// An http(s) address (http only for this machine, for tests and development).
+export function fetchableUrl(value: string): string | null {
+  try {
+    const u = new URL(value);
+    if (u.username || u.password) return null;
+    if (u.protocol === "https:") return u.href;
+    if (u.protocol === "http:" && (u.hostname === "127.0.0.1" || u.hostname === "localhost")) return u.href;
+  } catch {
+    // not a URL
+  }
+  return null;
+}
 
 export const config = {
   // Where the SQLite database and the generated key live (one volume).
@@ -56,6 +75,9 @@ export const config = {
     }
   },
   docsOrigin: () => new URL(config.docsUrl()).origin,
+  // The status data when the settings leave the address empty (the default).
+  statusSummaryUrl: () => fetchableUrl(text("STATUS_SUMMARY_URL")) ?? DEFAULT_STATUS_SUMMARY_URL,
+  statusServicesUrl: () => fetchableUrl(text("STATUS_SERVICES_URL")) ?? DEFAULT_STATUS_SERVICES_URL,
   // Origins that may call the public API from a browser (CORS).
   allowedOrigins: () => {
     const list = origins(text("ASK_ALLOWED_ORIGINS"));
