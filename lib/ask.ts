@@ -2,7 +2,8 @@
 // token or the Discord bot's token), whether Flo is on, the input limits,
 // the Discord allow-list, the block list, the docs excerpts, the limits and
 // the budget (reserved before the call), then the one model call, the
-// sanitised answer, the real cost, the statistics and the optional log.
+// sanitised answer (without its report classification line, returned as
+// `report`), the real cost, the statistics and the optional log.
 import Anthropic from "@anthropic-ai/sdk";
 import { config } from "./config";
 import { HttpError, bearer, clientIp, json, readJson } from "./http";
@@ -13,7 +14,7 @@ import { isBlocked, subjectKey, validDiscordSubject } from "./subjects";
 import { getSettings, type Settings } from "./settings";
 import { recordRejection, remainingToday, reserve, reservedNano, settle, type Source } from "./limits";
 import { docsIndex, docsTerms, isLocale, pickSections, type Locale, type Section } from "./docs";
-import { leaksPrompt, promptBytes, userTurn, excerptTitle, type Turn } from "./prompt";
+import { leaksPrompt, promptBytes, splitReport, userTurn, excerptTitle, type Turn } from "./prompt";
 import { ceilingNano, costNano } from "./models";
 import { askClaude, describeError } from "./claude";
 import { linksIn, sanitizeAnswer } from "./sanitize";
@@ -195,7 +196,11 @@ export async function askRoute(request: Request): Promise<Response> {
   const latencyMs = Math.round(performance.now() - started);
   // A refusal of the model, or an answer that repeats its instructions.
   const status = reply.stopReason === "refusal" || leaksPrompt(reply.text) ? "refusal" : reply.stopReason === "max_tokens" ? "max_tokens" : "ok";
-  let raw = reply.text.trim();
+  // The classification line (system prompt rule 14) never reaches the reader.
+  const split = splitReport(reply.text);
+  // Only a complete answer may offer a report – and only while reports are on.
+  const report = status === "ok" && settings.reports.enabled ? split.report : null;
+  let raw = split.text.trim();
   if (status === "refusal") raw = FALLBACK.refusal[input.locale];
   else if (status === "max_tokens") raw = raw ? `${raw} …\n\n${FALLBACK.cut[input.locale]}` : `${FALLBACK.cut[input.locale]}\n\n${FALLBACK.empty[input.locale]}`;
   else if (!raw) raw = FALLBACK.empty[input.locale];
@@ -226,5 +231,5 @@ export async function askRoute(request: Request): Promise<Response> {
     outcome: status,
   });
   const remaining = remainingToday(settings, asker.subject);
-  return json({ answer, sources, usage: remaining === null ? {} : { remainingToday: remaining } });
+  return json({ answer, sources, report, usage: remaining === null ? {} : { remainingToday: remaining } });
 }

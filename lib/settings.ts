@@ -24,6 +24,9 @@ export type Settings = {
   logging: { enabled: boolean; retentionDays: number };
   // The regular summary of the Q&A log (lib/insights.ts): how often, and its own model.
   insights: { interval: InsightsInterval; model: ModelId };
+  // Report drafts for Discord (lib/draft.ts): whether Flo offers them, the
+  // draft call's max_tokens and how many drafts one person may have per day.
+  reports: { enabled: boolean; maxTokens: number; perDay: number };
 };
 export type InsightsInterval = "off" | "daily" | "weekly";
 export const INSIGHTS_INTERVALS: InsightsInterval[] = ["off", "daily", "weekly"];
@@ -44,6 +47,7 @@ export const DEFAULT_SETTINGS: Settings = {
   discord: { channelIds: [], roleIds: [], onLimit: "message" },
   logging: { enabled: false, retentionDays: 30 },
   insights: { interval: "daily", model: DEFAULT_MODEL },
+  reports: { enabled: true, maxTokens: 1500, perDay: 5 },
 };
 
 // Ranges (the same as flowplan-admin's form). Every count and cost limit
@@ -71,6 +75,8 @@ const RANGES: Record<string, Range> = {
   "limits.global.costPerDayUsd": COST,
   "limits.global.costPerMonthUsd": COST,
   "logging.retentionDays": { min: 1, max: 365, int: true },
+  "reports.maxTokens": { min: 500, max: 4000, int: true },
+  "reports.perDay": { min: 1, max: 100, int: true },
 };
 // [smaller, larger]: the first must not exceed the second (on the merged result).
 const CHECKS: [string, string][] = [
@@ -82,7 +88,7 @@ const CHECKS: [string, string][] = [
   ["limits.global.perDay", "limits.global.perMonth"],
   ["limits.global.costPerDayUsd", "limits.global.costPerMonthUsd"],
 ];
-const BOOLEANS = ["enabled.global", "enabled.docs", "enabled.discord", "logging.enabled"];
+const BOOLEANS = ["enabled.global", "enabled.docs", "enabled.discord", "logging.enabled", "reports.enabled"];
 const ID_LISTS = ["discord.channelIds", "discord.roleIds"];
 const MAX_IDS = 50;
 

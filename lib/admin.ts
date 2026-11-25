@@ -17,7 +17,7 @@ import { topics } from "./topics";
 import { purgeLog, readLog } from "./qalog";
 import { listInsights, markInsightHandled, purgeInsights, readInsight, runInsights } from "./insights";
 import { MAX_HANDLED_TOPICS, addHandledTopic, editHandledTopic, listHandledTopics, removeHandledTopic } from "./handled-topics";
-import { insightsNano } from "./limits";
+import { draftsNano, insightsNano } from "./limits";
 import type { Source } from "./limits";
 
 export function requireAdmin(request: Request) {
@@ -53,6 +53,9 @@ export function adminSummary(at = now()) {
   const m = agg("month=?", month);
   // The insight summaries count against the budget too (not as questions).
   const insightsMonth = insightsNano("month", month);
+  // So do the report drafts (lib/draft.ts).
+  const draftsMonth = draftsNano("month", month);
+  const drafts = one<{ n: number; ok: number }>("SELECT COUNT(*) AS n, COALESCE(SUM(status='ok'),0) AS ok FROM drafts WHERE month=?", month) ?? { n: 0, ok: 0 };
   const budgetUsd = settings.monthlyBudgetUsd;
   const rejected = { subject: 0, global: 0, budget: 0, off: 0 };
   for (const r of all<{ scope: keyof typeof rejected; n: number }>("SELECT scope, SUM(count) AS n FROM rejections WHERE substr(day,1,7)=? GROUP BY scope", month))
@@ -62,10 +65,13 @@ export function adminSummary(at = now()) {
     status: { docs: state.docs, discord: state.discord, budgetReached: state.budgetReached, warn: state.warn },
     month: {
       ...totals(m),
-      costUsd: usd(m.nano + insightsMonth),
+      costUsd: usd(m.nano + insightsMonth + draftsMonth),
       insightsCostUsd: usd(insightsMonth),
+      drafts: drafts.n,
+      draftsOk: drafts.ok,
+      draftsCostUsd: usd(draftsMonth),
       budgetUsd,
-      percent: budgetUsd > 0 ? Math.round((usd(m.nano + insightsMonth) / budgetUsd) * 1000) / 10 : 100,
+      percent: budgetUsd > 0 ? Math.round((usd(m.nano + insightsMonth + draftsMonth) / budgetUsd) * 1000) / 10 : 100,
     },
     today: totals(agg("day=?", dayKey(at))),
     bySource: {

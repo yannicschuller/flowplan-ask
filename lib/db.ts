@@ -1,6 +1,7 @@
 // One SQLite file in the data directory (node:sqlite). The schema is built by
 // numbered migrations; the table schema_version holds the last one applied.
-// Nothing here holds a plain IP address, a Discord id or a session token:
+// Nothing here holds a plain IP address, a Discord id or a session token
+// (nor the text of a report draft):
 // subjects are HMACs (lib/subjects.ts), addresses daily HMACs (ipKey()).
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { mkdirSync } from "node:fs";
@@ -169,6 +170,35 @@ const MIGRATIONS: string[] = [
      actor TEXT NOT NULL DEFAULT ''
    );
    CREATE UNIQUE INDEX handled_topics_title ON handled_topics(lower(title));`,
+  // 4: report drafts (lib/draft.ts) – a bug report or feature request
+  // drafted from a Discord conversation. A row is the draft call's entry in
+  // the ledger: 'pending' with the reserved (maximum) cost while the call
+  // runs, then the real cost from the usage. subject is the HMAC of the
+  // bot's subject (as in questions), emptied after 40 days; the draft's
+  // text is never stored – only the counts and costs, for the limits, the
+  // budget and the statistics.
+  `CREATE TABLE drafts (
+     id INTEGER PRIMARY KEY,
+     at INTEGER NOT NULL,
+     day TEXT NOT NULL,
+     month TEXT NOT NULL,
+     subject TEXT NOT NULL DEFAULT '',
+     kind TEXT NOT NULL CHECK (kind IN ('bug','feature')),
+     status TEXT NOT NULL CHECK (status IN ('pending','ok','error')),
+     error TEXT NOT NULL DEFAULT '',
+     model TEXT NOT NULL,
+     reserved_nano INTEGER NOT NULL DEFAULT 0,
+     ceiling_nano INTEGER NOT NULL DEFAULT 0,
+     cost_nano INTEGER NOT NULL DEFAULT 0,
+     input_tokens INTEGER NOT NULL DEFAULT 0,
+     output_tokens INTEGER NOT NULL DEFAULT 0,
+     latency_ms INTEGER,
+     settled_at INTEGER
+   );
+   CREATE INDEX drafts_subject ON drafts(subject, day);
+   CREATE INDEX drafts_month ON drafts(month);
+   CREATE INDEX drafts_day ON drafts(day);
+   CREATE INDEX drafts_pending ON drafts(status) WHERE status = 'pending';`,
 ];
 export const SCHEMA_VERSION = MIGRATIONS.length;
 

@@ -1,12 +1,16 @@
 // The one call to the Claude API per question: no tools, no MCP, no web
-// access. The insight summary (lib/insights.ts) is a separate path with its
-// own call below – not a question, made on a schedule or by an admin, with
-// its own fixed system prompt and its own budget reservation. The client reads ANTHROPIC_API_KEY itself (new Anthropic()); the
+// access. Two separate paths have their own call below, each with its own
+// fixed system prompt and its own budget reservation: the insight summary
+// (lib/insights.ts – not a question, made on a schedule or by an admin) and
+// the report draft (lib/draft.ts – one per bug report or feature request a
+// person on Discord asks Flo to draft). The client reads ANTHROPIC_API_KEY itself (new Anthropic()); the
 // key is never logged and never part of an answer. Tests hand in a client
 // with a baseURL pointing to a local mock (useAnthropic()).
 import Anthropic from "@anthropic-ai/sdk";
 import { SYSTEM_PROMPT } from "./prompt";
 import { INSIGHTS_SCHEMA, INSIGHTS_SYSTEM_PROMPT } from "./prompt-insights";
+import { DRAFT_SCHEMAS, DRAFT_SYSTEM_PROMPT } from "./prompt-draft";
+import type { DraftKind } from "./limits";
 import type { ModelId } from "./models";
 
 const holder = globalThis as unknown as { askAnthropic?: Anthropic | null };
@@ -48,6 +52,19 @@ export async function summarizeClaude(input: { model: ModelId; maxTokens: number
     system: [{ type: "text", text: INSIGHTS_SYSTEM_PROMPT }],
     messages: [{ role: "user", content: [{ type: "text", text: input.user }] }],
     output_config: { effort: "low", format: { type: "json_schema", schema: INSIGHTS_SCHEMA as unknown as Record<string, unknown> } },
+  });
+  return answerOf(response);
+}
+
+// The report draft: one call per draft, no tools, no MCP, no web access,
+// no metadata; a structured (JSON) answer. No prompt cache – drafts are rare.
+export async function draftClaude(input: { model: ModelId; maxTokens: number; kind: DraftKind; user: string }): Promise<ClaudeAnswer> {
+  const response = await anthropic().messages.create({
+    model: input.model,
+    max_tokens: input.maxTokens,
+    system: [{ type: "text", text: DRAFT_SYSTEM_PROMPT }],
+    messages: [{ role: "user", content: [{ type: "text", text: input.user }] }],
+    output_config: { effort: "low", format: { type: "json_schema", schema: DRAFT_SCHEMAS[input.kind] as unknown as Record<string, unknown> } },
   });
   return answerOf(response);
 }

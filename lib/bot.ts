@@ -2,10 +2,13 @@
 // Discord user by the subject only it can compute (its HMAC of the user id).
 // Bearer ASK_BOT_TOKEN, compared in constant time; without a token 404.
 // The answer is the short hash flowplan-admin shows – never the subject.
+// POST /api/bot/report-draft drafts a bug report or feature request from a
+// conversation the bot sends (lib/draft.ts).
 import { config } from "./config";
 import { HttpError, bearer, clientIp, json, readJson } from "./http";
 import { LIMITS, ipKey, limit } from "./rate-limit";
 import { safeEqual } from "./secret";
+import { DRAFT_MAX_BODY, reportDraft } from "./draft";
 import { block, shortHash, subjectKey, unblockKey, validDiscordSubject } from "./subjects";
 
 function requireBot(request: Request) {
@@ -26,6 +29,8 @@ const validActor = (v: unknown) => v === undefined || v === "discord-mod" || (ty
 export async function botRoute(request: Request, name: string) {
   requireBot(request);
   if (request.method !== "POST") throw new HttpError(405, "method_not_allowed", "Method not allowed.");
+  // A bug report or feature request drafted from a conversation (lib/draft.ts).
+  if (name === "report-draft") return reportDraft(await readJson(request, DRAFT_MAX_BODY));
   if (name !== "block" && name !== "unblock") throw new HttpError(404, "not_found", "Not found.");
   const body = await readJson(request, 4096);
   const subject = validDiscordSubject(body.subject);

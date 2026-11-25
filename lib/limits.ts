@@ -34,9 +34,25 @@ function totals(where: string, ...args: (string | number)[]): Totals {
 export function insightsNano(column: "month" | "day", key: string) {
   return one<{ nano: number }>(`SELECT ${SPENT} AS nano FROM insights WHERE ${column}=?`, key)?.nano ?? 0;
 }
-const withInsights = (t: Totals, column: "month" | "day", key: string): Totals => ({ questions: t.questions, nano: t.nano + insightsNano(column, key) });
+// What the report drafts spent (their own calls, lib/draft.ts): part of the
+// global cost and the budget – and of the drafting person's cost – never of
+// anyone's question counts.
+export function draftsNano(column: "month" | "day", key: string, subject?: string) {
+  const who = subject === undefined ? "" : " AND subject=?";
+  const args = subject === undefined ? [key] : [key, subject];
+  return one<{ nano: number }>(`SELECT ${SPENT} AS nano FROM drafts WHERE ${column}=?${who}`, ...args)?.nano ?? 0;
+}
+const withInsights = (t: Totals, column: "month" | "day", key: string): Totals => ({
+  questions: t.questions,
+  nano: t.nano + insightsNano(column, key) + draftsNano(column, key),
+});
 const monthTotals = (at: number) => withInsights(totals("month=?", monthKey(at)), "month", monthKey(at));
 const dayTotals = (at: number) => withInsights(totals("day=?", dayKey(at)), "day", dayKey(at));
+
+const withDrafts = (t: Totals, column: "month" | "day", key: string, subject: string): Totals => ({
+  questions: t.questions,
+  nano: t.nano + draftsNano(column, key, subject),
+});
 
 // When a sliding window has room again: the oldest question in it leaves.
 function windowRetry(column: "subject" | "ip_key", key: string, since: number, windowMs: number) {
@@ -65,10 +81,10 @@ function firstBreach(settings: Settings, source: Source, subject: string, ip: st
   for (const [max, ms] of windows) {
     if (max > 0 && totals("subject=? AND at>?", subject, at - ms).questions >= max) return { scope: "subject", retryAt: windowRetry("subject", subject, at - ms + 1, ms) };
   }
-  const subjectDay = totals("subject=? AND day=?", subject, dayKey(at));
+  const subjectDay = withDrafts(totals("subject=? AND day=?", subject, dayKey(at)), "day", dayKey(at), subject);
   if (s.perDay > 0 && subjectDay.questions >= s.perDay) return { scope: "subject", retryAt: nextDay(at) };
   if (s.costPerDayUsd > 0 && subjectDay.nano + cost > nano(s.costPerDayUsd)) return { scope: "subject", retryAt: nextDay(at) };
-  const subjectMonth = totals("subject=? AND month=?", subject, monthKey(at));
+  const subjectMonth = withDrafts(totals("subject=? AND month=?", subject, monthKey(at)), "month", monthKey(at), subject);
   if (s.perMonth > 0 && subjectMonth.questions >= s.perMonth) return { scope: "subject", retryAt: nextMonth(at) };
   if (s.costPerMonthUsd > 0 && subjectMonth.nano + cost > nano(s.costPerMonthUsd)) return { scope: "subject", retryAt: nextMonth(at) };
 
@@ -187,7 +203,9 @@ export function settleStale(at = now(), olderThanMs = 10 * MINUTE) {
   for (const q of stale) settle(q.id, { status: "error", costNano: q.reserved_nano }, at);
   const staleInsights = all<{ id: number; reserved_nano: number }>("SELECT id,reserved_nano FROM insights WHERE status='pending' AND created_at<?", at - olderThanMs);
   for (const q of staleInsights) settleInsight(q.id, { status: "error", error: "interrupted", costNano: q.reserved_nano }, at);
-  return stale.length + staleInsights.length;
+  const staleDrafts = all<{ id: number; reserved_nano: number }>("SELECT id,reserved_nano FROM drafts WHERE status='pending' AND at<?", at - olderThanMs);
+  for (const q of staleDrafts) settleDraft(q.id, { status: "error", error: "interrupted", costNano: q.reserved_nano }, at);
+  return stale.length + staleInsights.length + staleDrafts.length;
 }
 
 // ---- the insight summaries (lib/insights.ts) ------------------------------
@@ -301,14 +319,88 @@ export function settleInsight(id: number, o: InsightOutcome, at = now()) {
 export const insightReservedNano = (id: number) =>
   one<{ reserved_nano: number }>("SELECT reserved_nano FROM insights WHERE id=? AND status='pending'", id)?.reserved_nano ?? 0;
 
+// ---- the report drafts (lib/draft.ts) ---------------------------------------
+// A draft is not a question either: its own row in `drafts`, its own
+// reservation, the same rule. In one BEGIN IMMEDIATE transaction: the
+// monthly budget and the global cost limits (shared with the questions and
+// the insight summaries), the person's drafts per day
+// (settings.reports.perDay) and the person's cost limits per day and month
+// (shared with their questions); then the maximum cost is reserved.
+
+export type DraftKind = "bug" | "feature";
+
+// Drafts left today for a subject.
+export function draftsLeftToday(settings: Settings, subject: string, at = now()) {
+  const used = one<{ n: number }>("SELECT COUNT(*) AS n FROM drafts WHERE subject=? AND day=?", subject, dayKey(at))?.n ?? 0;
+  return Math.max(0, settings.reports.perDay - used);
+}
+
+function draftBreach(settings: Settings, subject: string, cost: number, at: number): { scope: LimitScope; retryAt: number } | null {
+  const shared = insightBreach(settings, cost, at);
+  if (shared) return shared;
+  if (draftsLeftToday(settings, subject, at) <= 0) return { scope: "subject", retryAt: nextDay(at) };
+  const s = settings.limits.subject;
+  const day = withDrafts(totals("subject=? AND day=?", subject, dayKey(at)), "day", dayKey(at), subject);
+  if (s.costPerDayUsd > 0 && day.nano + cost > nano(s.costPerDayUsd)) return { scope: "subject", retryAt: nextDay(at) };
+  const month = withDrafts(totals("subject=? AND month=?", subject, monthKey(at)), "month", monthKey(at), subject);
+  if (s.costPerMonthUsd > 0 && month.nano + cost > nano(s.costPerMonthUsd)) return { scope: "subject", retryAt: nextMonth(at) };
+  return null;
+}
+
+// Checks the limits and records the draft with its reserved cost, or throws LimitError.
+export function reserveDraft(input: { settings: Settings; subject: string; kind: DraftKind; model: ModelId; ceilingNano: number; at?: number }): number {
+  const at = input.at ?? now();
+  const result = transaction(() => {
+    const breach = draftBreach(input.settings, input.subject, input.ceilingNano, at);
+    if (breach) return breach;
+    const r = run(
+      "INSERT INTO drafts(at,day,month,subject,kind,status,model,reserved_nano,ceiling_nano) VALUES(?,?,?,?,?,'pending',?,?,?)",
+      at,
+      dayKey(at),
+      monthKey(at),
+      input.subject,
+      input.kind,
+      input.model,
+      input.ceilingNano,
+      input.ceilingNano,
+    );
+    return Number(r.lastInsertRowid);
+  });
+  if (typeof result === "number") return result;
+  throw new LimitError(result.scope, result.retryAt);
+}
+
+export type DraftOutcome = { status: "ok" | "error"; costNano: number; error?: string; inputTokens?: number; outputTokens?: number; latencyMs?: number };
+// Replaces a draft's reservation by its real cost.
+export function settleDraft(id: number, o: DraftOutcome, at = now()) {
+  run(
+    `UPDATE drafts SET status=?, error=?, cost_nano=?, reserved_nano=0, input_tokens=?, output_tokens=?, latency_ms=?, settled_at=?
+     WHERE id=? AND status='pending'`,
+    o.status,
+    (o.error ?? "").slice(0, 40),
+    Math.max(0, Math.round(o.costNano)),
+    o.inputTokens ?? 0,
+    o.outputTokens ?? 0,
+    o.latencyMs ?? null,
+    at,
+    id,
+  );
+}
+
+// The worst case reserved for a pending draft (0 once settled).
+export const draftReservedNano = (id: number) =>
+  one<{ reserved_nano: number }>("SELECT reserved_nano FROM drafts WHERE id=? AND status='pending'", id)?.reserved_nano ?? 0;
+
 export const RETENTION = { subjectDays: 40, statsDays: 400 };
 // Subjects and hashed addresses are kept only as long as the monthly limits need them.
 export function purgeLedger(at = now()) {
   run("UPDATE questions SET subject='', ip_key='' WHERE at<? AND (subject<>'' OR ip_key<>'')", at - RETENTION.subjectDays * DAY);
+  run("UPDATE drafts SET subject='' WHERE at<? AND subject<>''", at - RETENTION.subjectDays * DAY);
   const before = dayKey(at - RETENTION.statsDays * DAY);
   run("DELETE FROM questions WHERE day<?", before);
   run("DELETE FROM rejections WHERE day<?", before);
   run("DELETE FROM topic_pages WHERE day<?", before);
   run("DELETE FROM topic_terms WHERE day<?", before);
   run("DELETE FROM insights WHERE day<?", before);
+  run("DELETE FROM drafts WHERE day<?", before);
 }
